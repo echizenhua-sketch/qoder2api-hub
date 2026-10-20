@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.6-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.9-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,96 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### 企业 / 团队订阅「自己工作用」（issue #56）
+
+团队账号与个人号在网关里没有区别——额度走的是组织共享池（`orgResourcePackage`，
+面板会显示为「共享额度」）。但**风控与审计**的判定对象是账号，不是网关，所以这里
+有一层可选的「自用保护」，目标是把**能被客户端行为避免的风险**先避掉：
+
+| 风险 | 网关能做的 | 开关（默认） |
+|---|---|---|
+| 单席位被并发打爆 → 10605 排队 | 每账号并发闸门（超出排队，不并发打上游） | `QD_TEAM_MAX_CONCURRENCY=1` |
+| 机器枪式请求节奏 | 请求启动间加最小间隔 + 抖动 | `QD_TEAM_MIN_GAP_MS=400` |
+| 被多人共用 → 组织审计可见 | 统计同一账号的客户端 IP 数，超阈值打 WARN | `QD_TEAM_MAX_CLIENTS=3` |
+| 排队被当成失败 | 排队时按 `retryAfterSeconds` 等待重试（#38/#51） | 内置 |
+
+- 只对**识别为团队/企业**的账号生效（`userType` 含 teams/enterprise，或额度快照里有共享池）；
+- `QD_TEAM_GUARD=auto|on|off`：auto（默认）只对团队号启用，on 强制全部启用，off 关闭；
+- 拿不到租约时**不会卡死**：等 `QD_TEAM_WAIT_SECS`（默认 30s）后 fail-open 并记一条 WARN。
+
+**网关不能替你避免的**（属于使用方式/合约层面，自己判断）：
+
+- 组织后台的用量与成员审计（你的调用会记在你名下）；
+- 席位被回收、token 被重置（反代立即失效）；
+- 把公司席位共享给组织外的人（额度、审计、条款三条都会踩线）；
+- 数据中心出口访问**国际版**容易被风控（见 #57 的容器告警）。
+
+### v1.5.9
+
+**🐛 问题修复 / 防风控对齐（PR #61 by ddddd-ren）**
+
+三处出站身份形态与官方客户端对不上，都可被动聚类成「网关特征」：
+
+- **出站 UA**：此前是 `Go-http-client/2.0`（Go 语言 HTTP 客户端默认值），而 Qoder 官方客户端是 Electron/Node 应用——等于每个请求自报「我是脚本」。现在按区域取官方 UA（CN `QoderWork/1.1.64` / INTL `Qoder/1.1.64`），覆盖 `headers()`、token 刷新、设备授权取 userinfo、PAT 导入的 jobToken 交换。
+- **请求 ID**：`X-Request-ID` 此前是「uid 派生的固定前缀 + 微秒」，那个前缀是**每个请求都在的稳定标记**。现在改为每请求纯随机 32 位 hex。
+- **设备码形态**：`derive_id` 从「32 位无连字符 hex」改为 **UUIDv4 形状**（与官方 machineId 同形），派生来源（uid+salt 加盐哈希）不变、同账号恒定、跨账号隔离。
+
+**⚠️ 存量号池注意**：设备码形态变化意味着上游会把每个已入池账号看成「换了一台设备」。想避免这次换设备，升级前设置 `QD_DEVICE_ID_LEGACY=1`（保持旧 32 位 hex 形态；该开关只影响格式，不影响派生来源）。新号池不需要。
+
+**验证**：全量 **42 suites / 1460+ checks / 0 failed**（PR 自带 17 条 + 本地补 5 条形态/开关断言）。
+
+### v1.5.8
+
+**🐛 问题修复**
+
+- **Codex / MCP 的 `namespace` 工具导致上游 400**（#63）：Codex 会在 `/v1/responses` 的工具列表里发 `type: "namespace"`（MCP / multi-agent）与 `web_search` 这类 Responses 专有类型。网关原样透传给 Qoder，上游反序列化阶段直接报 `unknown variant \`namespace\`, expected \`function\`` → 整个回合失败（稳定复现，不是网络抖动）。
+  现在两处都做过滤：`_tools_for_chat()`（Responses→Chat 转换）与 `normalize_tools()`（Chat 请求规范化）只保留 `function` 与已降级的 `custom`，其余类型丢弃并记一条**按类型节流**的 WARN（同类每 10 分钟一条）。`function` 工具与 custom 降级逻辑完全不变。
+  注：namespace/MCP 工具本身**仍不会被调用**——上游无法表达它们。要完整支持需要 namespace 拍平 + 响应端还原，属于后续特性。
+
+**验证**：全量 **42 suites / 1442 checks / 0 failed**（`_test_issue56_62.py` 扩到 31 条，覆盖工具过滤与告警）。
+
+### v1.5.7
+
+**🐛 问题修复**
+
+- **Anthropic 入口丢弃 Claude Code 的 adaptive 思考档位**（#62）：Claude Code 对**第三方模型名**发的是 `thinking={"type":"adaptive"}` + `output_config={"effort":"low|medium|high|max"}`。adaptive 是合法 dict 但没有 `effort`/`budget_tokens`，旧实现因此**整段跳过 `output_config` 分支** → 四档全部映射成 `None` → 上游按默认档（多数模型是 `max`）跑。用户选 low/high 都白选，而且因为默认是 max，表现为「更费 token / 更慢」但**不报错**。
+  现在 `thinking` 里取不到档位时回退读 `output_config.effort`；`disabled` 仍然尊重。
+- **`budget_tokens` 够不到 max**：断点表原来最高只到 `high`（>16384 一律 high），补一档 `<=32768 high / 更大 max`。
+
+**✨ 新增功能**
+
+- **团队/企业账号「自用保护」**（#56）：只对识别为团队号的账号生效（`userType` 含 teams/enterprise，或额度快照里有共享池），把**能由客户端行为避免**的风控点先避掉：
+  - 每账号**并发闸门**（`QD_TEAM_MAX_CONCURRENCY`，默认 1）：超出排队而不是并发打上游，避免撞 10605/RESOURCE_LIMIT；
+  - 请求启动间**最小间隔 + 抖动**（`QD_TEAM_MIN_GAP_MS`，默认 400ms），避免固定频率特征；
+  - **客户端 IP 统计**（`QD_TEAM_MAX_CLIENTS`，默认 3）：同一账号被多个 IP 使用时打 WARN，提醒可能被共用（组织审计最先看到的就是这个）；
+  - `QD_TEAM_GUARD=auto|on|off`（默认 auto）；拿不到租约时等 `QD_TEAM_WAIT_SECS`（30s）后 fail-open，不会卡死。
+  - README 新增「企业/团队订阅自己工作用」一节，列清**网关能避免**与**不能避免**的边界（组织审计、席位回收、共享给组织外、国际版数据中心出口）。
+
+**验证**：全量 **42 suites / 1436 checks / 0 failed**（新增 `_test_issue56_62.py` 25 条）。
+
+### v1.5.7
+
+**📚 文档**
+
+- 新增 **`docs/risk-control-and-queueing.md`**：Qoder 国际版风控与排队的完整观察笔记——
+  上游看到的维度（客户端指纹 / 设备身份 / 账号 / 网络 / 行为）、处置等级（10605 排队、403、429、
+  418、内容审核）、多账号为什么仍会排队、分层缓解办法与反模式。
+- 含对**官方桌面端**（`qoderclicn.exe` / `app.asar`）的只读逆向结论：
+  - 排队走**独立轮询协议** `GET /api/v2/service/ask/queue/status?requestSetId&modelKey&queueType`，
+    每轮 sleep `retryAfterSeconds`，`isQueued=false` 才继续，`serviceAvailable=false` 继续轮询，
+    连续 3 次失败判致命，**总等待默认 60 分钟**（`QODER_MODEL_QUEUE_MAX_WAIT_MS`）；
+  - 官方推理头为 `Cosy-Version / Cosy-ClientType / Cosy-MachineOS / Cosy-MachineHostname`（仅 infer-sse）；
+  - 设备身份由原生 SDK 计算（`resources/umid/sgsdk.dll` + `runtime-info.exe`，函数名含 `NATIVE_RISK_IDENTITY`）；
+  - 客户端专门渲染的错误码：`10605 / 114 / 430 / 100401 / 100403 / 80411 …`。
+
+**⚙️ 行为调整（排队预算对齐官方）**
+
+- 网关排队等待从「3 轮 × 30s ≈ 90s」提升到**分钟级**：`QD_QUEUE_MAX_ROUNDS` 默认 **6**、
+  `QD_QUEUE_WAIT_BUDGET_SECS` 默认 **600**（10 分钟），单轮仍受 `QD_QUEUE_WAIT_MAX_SECS`（180s）约束；
+- 每次等待加 **0~2s 抖动**（`QD_QUEUE_WAIT_JITTER`），避免多客户端同时唤醒一起打同一队列。
+
+**验证**：全量 **42 suites / 1443 checks / 0 failed**。
 
 ### v1.5.6
 

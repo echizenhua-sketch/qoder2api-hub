@@ -123,9 +123,13 @@ _exc = P.UpstreamStatus(403, _DETAIL)
 check("#51b 嵌套 detail 里的 retryAfterSeconds 能解析出来",
       P._queue_wait_seconds(_DETAIL) == 30, P._queue_wait_seconds(_DETAIL))
 check("#51b 信封层识别排队信号", P._envelope_queue_wait(_exc) == 30)
-check("#51b 排队时允许多等几轮（attempt 0/1/2 可重试，3 停止）",
-      [P.should_retry_envelope(_exc, 0, a) for a in range(4)]
-      == [True, True, True, False])
+# issue #57 后续：预算对齐官方（分钟级）——默认允许 6 轮排队重试
+check("#51b 排队时允许多等几轮（默认 6 轮，第 7 次停止）",
+      [P.should_retry_envelope(_exc, 0, a) for a in range(8)]
+      == [True, True, True, True, True, True, False, False])
+check("#57 队列预算默认分钟级（600s / 6 轮 / 抖动 2s）",
+      P.QUEUE_WAIT_BUDGET_SECS == 600 and P.QUEUE_MAX_ROUNDS == 6
+      and P.QUEUE_WAIT_JITTER_SECS == 2.0)
 check("#51b 重开前按 retryAfterSeconds 等待（30+1=31s）",
       P._envelope_retry_wait(_exc, 1) == 31, P._envelope_retry_wait(_exc, 1))
 check("#51b 已向客户端吐过字节就不再重开",

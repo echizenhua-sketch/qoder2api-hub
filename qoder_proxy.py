@@ -43,6 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import random
 import uuid
 
 import qoder_accounts
@@ -56,7 +57,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.6"
+VERSION = "1.5.9"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3212,6 +3213,12 @@ def normalize_tools(obj):
     for t in tools:
         if not isinstance(t, dict):
             continue
+        _kind2 = t.get("type")
+        if _kind2 not in (None, "function"):
+            # issue #63：namespace / web_search 等类型 Qoder 无法表达，
+            # 透传会导致上游 400（unknown variant）。丢弃并告警。
+            _log_unsupported_tool(_kind2, "chat-tools")
+            continue
         if "name" in t and "function" not in t and t.get("type") == "function":
             fn = {
                 "name": t.get("name") or "",
@@ -5091,9 +5098,14 @@ TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退�
 # 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
 #   单轮最长等 QUEUE_WAIT_MAX_SECS；整次请求总预算 QUEUE_WAIT_BUDGET_SECS；
 #   最多等 QUEUE_MAX_ROUNDS 轮。超出预算仍按原错误返回（fail-open 语义不变）。
-QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 3)
+# issue #57 后续（逆向官方客户端）：官方排队是**独立轮询协议**，总等待默认 60 分钟
+# （QODER_MODEL_QUEUE_MAX_WAIT_MS=3600000），每轮 sleep retryAfterSeconds。
+# 网关是同步 HTTP，不能真等 60 分钟；这里给分钟级预算（默认 10 分钟 / 6 轮），
+# 仍可用 QD_QUEUE_* 覆盖。
+QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 6)
 QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
-QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 300)
+QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 600)
+QUEUE_WAIT_JITTER_SECS = float(os.environ.get("QD_QUEUE_WAIT_JITTER") or 2.0)
 
 
 def _queue_wait_seconds(detail):
@@ -5458,6 +5470,175 @@ class PayloadTooLarge(UpstreamStatus):
         self.limit = int(limit)
 
 
+# ---------------------------------------------------------------------------
+# issue #56：团队/企业订阅「自己工作用」的风险收敛
+#
+# 能避的风险（本模块负责）：
+#   1) 单席位**并发打爆** —— 团队套餐按席位限流，一个账号被多路并发很容易撞
+#      10605/RESOURCE_LIMIT；这里给每账号一个并发闸门（默认 1）。
+#   2) **机器枪式**请求节奏 —— 请求启动之间加最小间隔 + 抖动，避免固定频率特征。
+#   3) **误共享** —— 记录同一账号来自多少个不同客户端 IP；超过阈值打 WARN，
+#      提醒你可能有人共用这把 Key（组织审计最先看到的就是这个）。
+# 不能避的：额度归属、组织后台可见性、席位被回收、以及条款层面的问题。
+# ---------------------------------------------------------------------------
+_CLIENT_CTX = threading.local()
+_TEAM_GUARD_LOG = {"warned_wait": False, "ips": {}}
+
+
+def _team_guard_mode():
+    raw = str(os.environ.get("QD_TEAM_GUARD") or "auto").strip().lower()
+    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
+        return "on"
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return "off"
+    return "auto"
+
+
+def _team_max_concurrency():
+    try:
+        return max(1, int(os.environ.get("QD_TEAM_MAX_CONCURRENCY") or 1))
+    except Exception:
+        return 1
+
+
+def _team_min_gap():
+    try:
+        return max(0.0, float(os.environ.get("QD_TEAM_MIN_GAP_MS") or 400) / 1000.0)
+    except Exception:
+        return 0.4
+
+
+def _is_team_account(account):
+    """团队/企业账号判定：userType 或额度快照里有组织共享池（issue #56）。"""
+    if account is None:
+        return False
+    ut = str(getattr(account, "user_type", "") or "").lower()
+    if "team" in ut or "enterprise" in ut:
+        return True
+    cred = getattr(account, "credits", None)
+    if isinstance(cred, dict):
+        if isinstance(cred.get("shared"), dict) and cred["shared"].get("size"):
+            return True
+        for pkg in cred.get("packages") or []:
+            if isinstance(pkg, dict) and pkg.get("name") == "共享额度":
+                return True
+    return False
+
+
+def _team_guard_on(account):
+    mode = _team_guard_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return _is_team_account(account)
+
+
+def _team_acquire(account, model=""):
+    """拿一个团队账号租约（并发闸门 + 最小间隔）。拿不到返回 None（fail-open）。"""
+    if not _team_guard_on(account):
+        return None
+    try:
+        now = time.time()
+        gap = _team_min_gap()
+        with account._team_lock:
+            # 过期租约（>10min）视为泄漏，惰性清理，避免异常路径永久占坑
+            account.team_leases = {k: v for k, v in
+                                   (getattr(account, "team_leases", {}) or {}).items()
+                                   if now - v < 600}
+            last = float(getattr(account, "team_last_start", 0) or 0)
+        wait = max(0.0, last + gap - now)
+        if wait > 0:
+            time.sleep(min(wait, 5.0) + random.uniform(0, 0.12))
+        deadline = time.time() + float(os.environ.get("QD_TEAM_WAIT_SECS") or 30)
+        limit = _team_max_concurrency()
+        while True:
+            with account._team_lock:
+                if len(getattr(account, "team_leases", {})) < limit:
+                    lid = uuid.uuid4().hex
+                    account.team_leases[lid] = time.time()
+                    account.team_last_start = time.time()
+                    return lid
+            if time.time() >= deadline:
+                if not _TEAM_GUARD_LOG["warned_wait"]:
+                    _TEAM_GUARD_LOG["warned_wait"] = True
+                    log("team guard: concurrency limit %d reached for %s - "
+                        "proceeding without lease (issue #56)"
+                        % (limit, account.uid[:8]), level="WARN", tag="chat")
+                return None
+            time.sleep(0.05)
+    except Exception:
+        return None
+
+
+def _team_release(account, lease):
+    if not lease or account is None:
+        return
+    try:
+        with account._team_lock:
+            (getattr(account, "team_leases", {}) or {}).pop(lease, None)
+    except Exception:
+        pass
+
+
+def _team_note_client(account):
+    """记录本账号见过的客户端 IP；过多说明可能被共用（issue #56）。"""
+    if not _team_guard_on(account):
+        return
+    try:
+        ip = getattr(_CLIENT_CTX, "ip", None)
+        if not ip:
+            return
+        now = time.time()
+        with account._team_lock:
+            seen = {k: v for k, v in
+                    (getattr(account, "team_client_ips", {}) or {}).items()
+                    if now - v < 3600}
+            seen[ip] = now
+            account.team_client_ips = seen
+            n = len(seen)
+        limit = int(os.environ.get("QD_TEAM_MAX_CLIENTS") or 3)
+        if n > limit:
+            key = account.uid[:8]
+            last = _TEAM_GUARD_LOG["ips"].get(key, 0)
+            if now - last > 1800:
+                _TEAM_GUARD_LOG["ips"][key] = now
+                log("team guard: account %s used from %d distinct clients in "
+                    "the last hour - if this is a shared key, the org audit "
+                    "will see it (issue #56)" % (account.uid[:8], n),
+                    level="WARN", tag="chat")
+    except Exception:
+        pass
+
+
+class _TeamLeaseResp(object):
+    """把响应包一层：关闭/退出时释放团队租约（issue #56）。"""
+
+    def __init__(self, resp, account, lease):
+        self._resp = resp
+        self._account = account
+        self._lease = lease
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+    def __iter__(self):
+        return iter(self._resp)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self._resp.close()
+        finally:
+            _team_release(self._account, self._lease)
+
+
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
@@ -5553,6 +5734,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         host_i = 0
         raw_url = hosts[host_i] + CHAT_PATH
 
+        # issue #56：团队账号的并发闸门 + 最小间隔（非团队账号直接返回 None）
+        _team_lease = _team_acquire(account, model)
+        _team_note_client(account)
+
         # ---- 发起请求（瞬时上游故障同账号快速重试） ----
         resp = None
         last_exc = None
@@ -5597,7 +5782,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                         "(round %d/%d)"
                         % (account.uid[:8], model, qwait, queue_tries,
                            QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
-                    time.sleep(qwait + 1)
+                    # 抖动 0~2s：多客户端同时被唤醒会一起打同一队列
+                    time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
                     continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
@@ -5646,7 +5832,14 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             # task-74 三族：成功收尾 -> 统一复位（三族计数 + 软冷却 + 模型冷却）。
             # note_success 是 clear_error(model) 的超集；刻意不动 balance_until。
             account.note_success(model=model)
+            if _team_lease:
+                # 关闭/退出时自动释放租约（handler 都走 with resp / resp.close）
+                return _TeamLeaseResp(resp, account, _team_lease), account, encoded
             return resp, account, encoded
+
+        # 本次尝试失败：先还租约，再做错误分类（分类里可能 continue/raise）
+        _team_release(account, _team_lease)
+        _team_lease = None
 
         exc = last_exc
         # ---- 错误分类（与原有轮换语义一致） ----
@@ -6199,6 +6392,20 @@ CUSTOM_TOOL_HINT = (
 )
 
 
+_UNSUPPORTED_TOOL_LOG = {}
+
+
+def _log_unsupported_tool(kind, where="tools"):
+    """未知工具类型被丢弃时记一次 WARN（同类每 10 分钟一条，issue #63）。"""
+    key = str(kind or "?")
+    now = time.time()
+    if now - _UNSUPPORTED_TOOL_LOG.get(key, 0) < 600:
+        return
+    _UNSUPPORTED_TOOL_LOG[key] = now
+    log("dropped unsupported tool type %r at %s - Qoder upstream only accepts "
+        '"function" (issue #63)' % (key, where), level="WARN", tag="chat")
+
+
 def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
@@ -6239,12 +6446,25 @@ def _downgrade_custom_tool(tool):
 
 
 def _tools_for_chat(tools):
-    """Downgrade custom tools; leave everything else untouched."""
+    """只保留 Qoder 上游能表达的工具（issue #63）。
+
+    Codex / MCP 会发 `type: "namespace"`、`web_search` 这类 Responses 专有工具；
+    原样透传会让上游在反序列化阶段 400（`unknown variant namespace, expected
+    function`），整个回合失败。这里把它们丢掉并记一次告警——function 工具不受
+    影响，custom 仍按原逻辑降级。
+    """
     out = []
     for t in tools or []:
         if not isinstance(t, dict):
             continue
-        out.append(_downgrade_custom_tool(t) if _is_custom_tool(t) else t)
+        if _is_custom_tool(t):
+            out.append(_downgrade_custom_tool(t))
+            continue
+        _kind = t.get("type")
+        if _kind in (None, "function"):
+            out.append(t)
+            continue
+        _log_unsupported_tool(_kind, "responses-tools")
     return out
 
 
@@ -7409,6 +7629,11 @@ class Handler(BaseHTTPRequestHandler):
         # 会带回上一次 chat 的残留值 —— 那会让面板把「上一次的出口」当成「本次的」。
         self.realm_used = ""
         self.realm_reason = ""
+        # issue #56：记录客户端 IP（团队账号的「是否被共用」统计用）
+        try:
+            _CLIENT_CTX.ip = self.client_address[0]
+        except Exception:
+            pass
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -8778,6 +9003,11 @@ class Handler(BaseHTTPRequestHandler):
         # chat 的出口/原因带到别的响应上。
         self.realm_used = ""
         self.realm_reason = ""
+        # issue #56：记录客户端 IP（团队账号「是否被共用」统计用）
+        try:
+            _CLIENT_CTX.ip = self.client_address[0]
+        except Exception:
+            pass
         path = self.path.split("?")[0]
         if path == "/settings/save":
             if not self._panel_ok():
