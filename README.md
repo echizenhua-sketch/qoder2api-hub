@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.5-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.6-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,24 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.6
+
+**🐛 问题修复**
+
+- **多模态请求出站体积膨胀 3 倍，撞 30MB 限制后被 RST**（#59）：`build_qoder_body` 在 `messages` 的结构化 parts 之外，又把整份 Base64 **重复塞了两处**（`body.image_urls` + `chat_context.imageUrls`）。上游只读 parts，这两份纯冗余——10 张图 15MB 会变成 48MB、编码后约 64MB，超过阿里云 SLB 的 30MB 硬限制被强断（Broken pipe），而 Broken pipe 又被当成瞬态故障反复重试，最终把整个账号池打到熔断。现在默认不再填这两处（`QD_KEEP_TOPLEVEL_IMAGES=1` 可恢复旧行为）。
+- **出站体积前置保护**：编码后若超过 `QD_MAX_BODY_MB`（默认 29MB）**就地返回 HTTP 413**，不发网络请求、不轮询账号、不写冷却——不会再因为一个超大包拖垮整个号池。
+- **zcode 工具调用漏成正文**（#60）：模型把内层 `arguments` 的引号**未转义**地写出来时，外层数组也不是合法 JSON，此前四条回读路径全拒 → 整段协议当正文下发。现在增加「抢救式解析」（补齐内层引号转义后按同一套严格校验重建），并在流式 hold 阶段对「数组中途的 delimiter 错误」保持候选，不再中途证伪。实测截图原文在 8/64/整段分帧下都能恢复为 `tool_calls`。
+
+**✨ 新增功能**
+
+- **模型清单磁盘缓存 + 手动刷新**（#58）：动态发现成功的清单会落盘（7 天有效），容器重启或上游抖动时先用上次结果，不再回退到陈旧的内置快照；新增 `GET /models/refresh`（面板鉴权）可强制重新发现。
+
+**⚠️ 提示**
+
+- **不要在容器里反代国际版**（#57）：数据中心出口访问 intl 网关容易被风控（表现为聊天排队）。检测到「容器 + intl 账号」时启动日志会给 WARN 提示；建议用住宅出口或改用国内版。
+
+**验证**：全量 **41 suites / 1411 checks / 0 failed**（新增 `_test_issue57_60.py` 19 条）。
 
 ### v1.5.5
 

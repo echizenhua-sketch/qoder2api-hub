@@ -56,7 +56,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2339,6 +2339,46 @@ def read_local_models(realm=None):
     return []
 
 
+_MODELS_DISK_CACHE_TTL = 7 * 24 * 3600      # 7 天（动态失败时保底，issue #58）
+
+
+def _models_cache_path(realm):
+    """动态模型清单的磁盘缓存路径（issue #58）。"""
+    return os.path.join(ACCOUNTS_DIR, "models-cache-%s.json" % (realm or "cn"))
+
+
+def _save_models_cache(realm, live):
+    """把**动态发现**的模型清单落盘（容器重启/网络抖动后仍能看到新模型）。"""
+    try:
+        rows = [{"key": mid, "meta": meta} for mid, meta in live]
+        blob = {"at": time.time(), "realm": realm or "cn", "models": rows}
+        path = _models_cache_path(realm)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(blob, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        log("models cache write failed: %s" % exc, level="WARN")
+
+
+def _load_models_cache(realm):
+    """读磁盘缓存；过期或损坏返回 []（issue #58）。"""
+    try:
+        path = _models_cache_path(realm)
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+        if time.time() - float(blob.get("at") or 0) > _MODELS_DISK_CACHE_TTL:
+            return []
+        out = []
+        for row in blob.get("models") or []:
+            mid = row.get("key")
+            if mid:
+                out.append((mid, row.get("meta") or {}))
+        return out
+    except Exception:
+        return []
+
+
 def fetch_models(realm=None):
     r = realm or CURRENT_REALM
     with _lock:
@@ -2347,6 +2387,10 @@ def fetch_models(realm=None):
             return c["data"]
     # 1) 动态接口（需要账号） 2) 本机官方目录缓存 3) 内嵌静态快照
     live = read_dynamic_models(realm=r)
+    if live:
+        _save_models_cache(r, live)      # issue #58：成功的动态清单落盘
+    if not live:
+        live = _load_models_cache(r)     # 动态拿不到时先用上次成功的结果
     if not live:
         live = read_local_models(realm=r)
     entries = merge_catalog(live, realm=r)
@@ -3504,6 +3548,42 @@ _HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档
 _HOLD_MAX_FRAMES = 200             # 连续空转帧上限（帧不增长才算一帧）
 
 
+_ECHO_LOOSE_RE = re.compile(
+    r'^\[\s*\{\s*"name"\s*:\s*"([^"]{1,200})"\s*,\s*"arguments"\s*:\s*"(.*)"\s*\}\s*\]$',
+    re.DOTALL)
+
+
+def _repair_json_quotes(text):
+    """把「内层未转义的双引号」补上转义（issue #60）。
+
+    模型会写出 `"arguments": "{"filename":"a.png"}"` —— 内部引号没转义，
+    连外层数组都不是合法 JSON。这里先把已转义的占位，再把裸引号转义，复原。
+    """
+    ph = "\x00"
+    s = (text or "").replace('\\"', ph)
+    s = s.replace('"', '\\"')
+    return s.replace(ph, '\\"')
+
+
+def _salvage_echo_array(rest):
+    """宽松重建「[{"name":…,"arguments":"<未转义 JSON>"}]」（issue #60）。
+
+    严格 json.loads 失败时才调用；只处理**单调用**形态（模型复述几乎都是单调用），
+    重建后再交给调用方做同一套严格校验（name 命中声明、arguments 合法）。
+    """
+    m = _ECHO_LOOSE_RE.match((rest or "").strip())
+    if not m:
+        return None
+    name, raw_args = m.group(1), m.group(2)
+    for cand in (raw_args, _repair_json_quotes(raw_args)):
+        try:
+            json.loads(cand)
+            return [{"name": name, "arguments": cand}]
+        except Exception:
+            continue
+    return None
+
+
 def parse_leaked_tool_calls(text, allowed_names=None):
     """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
 
@@ -3571,7 +3651,10 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     try:
         arr = json.loads(rest)
     except Exception:
-        return None, text
+        # issue #60：内层引号未转义时外层也非法——按单调用形态抢救一次
+        arr = _salvage_echo_array(rest)
+        if arr is None:
+            return None, text
     if not isinstance(arr, list) or not arr:
         return None, text
     calls = []
@@ -3698,6 +3781,13 @@ def _json_array_prefix_ok(text):
             # 为稳妥两种位置都检查。
             return (s[max(0, pos - 1):pos + 1] == "\\u"
                     or s[pos:pos + 2] == "\\u")
+        # issue #60: 内层 arguments 的引号未转义时，json 会在数组中途报
+        # "Expecting , delimiter" / "Expecting property name"。这不是截断，
+        # 而是要靠流末 salvage 重建——继续 hold，别中途证伪漏成正文。
+        if ("arguments" in s and (
+                msg.startswith("Expecting ',' delimiter")
+                or msg.startswith("Expecting property name"))):
+            return True
         if msg.startswith("Extra data"):
             # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
             tail = s[pos:].strip()
@@ -4713,6 +4803,18 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
     return system_text, flat, images
 
 
+# issue #59：出站体积前置限制。阿里云 SLB 对单个 POST body 有 30MB 硬限制，
+# 超过会直接 RST（本地表现为 Broken pipe），而 Broken pipe 会被当成瞬态故障
+# 反复重试、最终把整个账号池打到熔断。留 1MB 余量。
+MAX_UPSTREAM_BODY_BYTES = int(float(os.environ.get("QD_MAX_BODY_MB") or 29)
+                               * 1024 * 1024)
+
+
+def _keep_toplevel_images():
+    """是否保留顶层冗余图片字段（默认否，issue #59）。"""
+    return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
+
+
 def build_qoder_body(payload, account, model_key, realm=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
@@ -4813,7 +4915,11 @@ def build_qoder_body(payload, account, model_key, realm=None):
     extra["originalContent"] = oc
     extra["modelConfig"] = dict(mc)
     cc["extra"] = extra
-    if images:
+    if images and _keep_toplevel_images():
+        # issue #59：上游**只读** messages 里的结构化 image_url parts（v1.4.2 实测），
+        # 顶层这两份是纯冗余：10 张图 15MB -> 出站 48MB -> qoder_encode 后 ~64MB，
+        # 撞上阿里云 SLB 30MB 限制被 RST（Broken pipe），还会把账号池打到熔断。
+        # 默认不再填充；QD_KEEP_TOPLEVEL_IMAGES=1 可恢复旧行为（仅排查用）。
         cc["imageUrls"] = images
         body["image_urls"] = images
     body["chat_context"] = cc
@@ -5072,6 +5178,19 @@ def _is_transient_transport(exc):
     return False
 
 
+def _in_container():
+    """是否跑在容器里（issue #57 的风控告警用，判定保守）。"""
+    try:
+        if os.path.exists("/.dockerenv"):
+            return True
+        with open("/proc/1/cgroup", encoding="utf-8", errors="ignore") as fh:
+            blob = fh.read()
+        return ("docker" in blob) or ("containerd" in blob) \
+            or ("kubepods" in blob)
+    except Exception:
+        return False
+
+
 def _friendly_net_error(exc, target=""):
     """把 urlopen/连接类异常翻成可操作的中文（issue #52）。
 
@@ -5108,7 +5227,7 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
-    # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
+    # issue #59：出站体积超限（本地拦下，没发出去）\n    if "payload too large" in detail:\n        return ("请求体过大（超过上游 30MB 限制）：网关已在本地拦下、未发送。"\n                "请减少图片数量/尺寸（或改用更小的图）后重试。详情：%s"\n                % detail[:160], "payload_too_large")\n    # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
     if "10605" in detail or "isQueued" in detail or "RESOURCE_LIMIT" in detail:
         return ("上游排队中（10605 / RESOURCE_LIMIT）：已按 retryAfterSeconds 等待并重试，"
                 "仍拿不到可用资源。请稍后重试；若频繁出现，说明该模型当前排队严重。"
@@ -5322,6 +5441,23 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 pass
 
 
+class PayloadTooLarge(UpstreamStatus):
+    """出站请求体超过上游 SLB 限制（issue #59）。
+
+    阿里云 SLB 对单个 POST body 有 30MB 硬限制，超过直接 RST（本地表现为
+    Broken pipe）。必须**在发网络请求前**拦住：Broken pipe 会被 _is_transient_transport
+    当成瞬态故障反复重试，最终把账号池打到熔断（报告者的连锁故障）。
+    """
+
+    def __init__(self, size, limit):
+        super(PayloadTooLarge, self).__init__(
+            413,
+            "payload too large: %d bytes > %d limit; the request was not sent"
+            % (int(size), int(limit)))
+        self.size = int(size)
+        self.limit = int(limit)
+
+
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
@@ -5363,6 +5499,13 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         # 在响应头/日志里对用户可见，也让 usage 行与真实出账区一致。
         usage_ctx["realm"] = realm
     encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
+    # issue #59：超限就地报 413，不发网络请求、不轮询账号（Broken pipe 会打爆账号池）
+    _size = len(encoded.encode("utf-8")) if isinstance(encoded, str) else len(encoded)
+    if _size > MAX_UPSTREAM_BODY_BYTES:
+        log("outbound payload too large (%d bytes > %d) - refusing to send "
+            "(issue #59)" % (_size, MAX_UPSTREAM_BODY_BYTES),
+            level="WARN", tag="chat")
+        raise PayloadTooLarge(_size, MAX_UPSTREAM_BODY_BYTES)
 
     if not session_key:
         session_key = derive_affinity_key(body_obj.get("messages"))
@@ -7374,6 +7517,29 @@ class Handler(BaseHTTPRequestHandler):
                                     "options": ["intl", "cn"],
                                     "auto_enabled": bool(AUTO_REALM_ENABLED),
                                     "auto_env": "QD_AUTO_REALM"})
+        if path in ("/models/refresh", "/v1/models/refresh"):
+            # issue #58：容器里模型清单陈旧时，不必重启即可重新向上游发现。
+            if not self._authorized():
+                return
+            req_realm = self._request_realm() or CURRENT_REALM
+            with _lock:
+                _models_cache.pop(req_realm, None)
+            try:
+                live = read_dynamic_models(realm=req_realm)
+            except Exception as exc:
+                return self._error(502, "model refresh failed: %s" % exc)
+            if not live:
+                return self._json(200, {"ok": False, "realm": req_realm,
+                                        "error": "upstream returned no models "
+                                                 "(check account/network)"})
+            _save_models_cache(req_realm, live)
+            entries = merge_catalog(live, realm=req_realm)
+            with _lock:
+                _models_cache[req_realm] = {"at": time.time(),
+                                            "data": entries}
+            return self._json(200, {"ok": True, "realm": req_realm,
+                                    "count": len(entries),
+                                    "ids": [mid for mid, _m in entries]})
         if path in ("/v1/models", "/models"):
             if not self._authorized():
                 return
@@ -8296,6 +8462,14 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
             return self._rate_limited(exc)
+        except UpstreamStatus as exc:
+            # issue #59：PayloadTooLarge(413) 等本地拦下的错误——明确状态码，
+            # 不进账号冷却/重试链路（上游根本没收到这个请求）。
+            _code = _to_int_status(exc.status)
+            record_error(model, _code, exc.detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            _msg, _etype = friendly_upstream_error(_code, exc.detail)
+            return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
             detail = getattr(exc, "qoder_detail", "")
             if not detail:
@@ -8431,6 +8605,14 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int(t * 1000))
             return self._rate_limited(exc)
+        except UpstreamStatus as exc:
+            # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
+            # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
+            _code = _to_int_status(exc.status)
+            record_error(model, _code, exc.detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            _msg, _etype = friendly_upstream_error(_code, exc.detail)
+            return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
             # 错误体在 open_upstream 中已读过（挂在 qoder_detail），二次 read
             # 会拿到残缺内容——优先取挂载值。
@@ -8708,6 +8890,14 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
             return self._rate_limited(exc)
+        except UpstreamStatus as exc:
+            # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
+            # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
+            _code = _to_int_status(exc.status)
+            record_error(model, _code, exc.detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            _msg, _etype = friendly_upstream_error(_code, exc.detail)
+            return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
             # 错误体在 open_upstream 中已读过（挂在 qoder_detail），二次 read
             # 会拿到残缺内容——优先取挂载值。
@@ -9030,6 +9220,18 @@ def main():
     except Exception as exc:
         CREDITS_USAGE_REFRESHER = None
         log("credits usage refresher failed to start: %s" % exc, level="WARN")
+    # issue #57：容器出口反代**国际版**容易被上游风控（聊天变排队）。检测到
+    # 容器 + intl 账号时给出明确告警——不阻断，只提示换自建出口或改用国内版。
+    try:
+        _intl = [a for a in (POOL.accounts if POOL else [])
+                 if getattr(a, "realm", "") == "intl" and a.enabled]
+        if _intl and _in_container():
+            log("container egress + intl accounts detected (%d): upstream may "
+                "rate-limit or queue the intl gateway from datacenter IPs. "
+                "Prefer a residential egress or the CN realm (issue #57)."
+                % len(_intl), level="WARN", tag="realm")
+    except Exception:
+        pass
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
