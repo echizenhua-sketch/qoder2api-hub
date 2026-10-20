@@ -14,7 +14,14 @@ import sys
 import time as _time_mod
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 兼容两种运行位置：项目根（python3 tests/test_checkin_window.py）与
+# tests 目录（cd tests && python3 test_checkin_window.py）——项目模块在
+# 上一级目录里。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+for _p in (_ROOT, _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import qoder_accounts as qa
 
@@ -228,42 +235,47 @@ class T3_LegacyUpgrade(unittest.TestCase):
 
 class T4_SchedulerSlots(unittest.TestCase):
 
-    def test_slots_cover_window(self):
+    def _bare_scheduler(self, slots, primary=None):
+        """造一个只够跑 _calc_next_fire 的调度器（跳过 __init__ 的副作用）。
+
+        必须补齐 _slots_lock —— 槽位改为配置驱动后，_calc_next_fire 会持锁
+        读列表，缺这个属性会 AttributeError。
+        """
+        import threading
         import qoder_scheduler as qs
         s = qs.Scheduler.__new__(qs.Scheduler)
         s.keepalive_hours = [22]
-        s.checkin_slots = [(9, 0), (10, 1), (10, 5), (10, 15), (11, 0),
-                           (21, 0)]
-        s.checkin_primary_slots = [(10, 1), (21, 0)]
+        s._slots_lock = threading.RLock()
+        s.checkin_slots = slots
+        s.checkin_primary_slots = primary or []
         s.all_hours = sorted(set([h for h, _ in s.checkin_slots] + [22]))
         s.next_run_time = None
+        return s
+
+    def test_slots_cover_window(self):
+        s = self._bare_scheduler(
+            [(9, 0), (10, 1), (10, 5), (10, 15), (11, 0), (21, 0)],
+            [(10, 1), (21, 0)])
         for slot in [(10, 1), (10, 5), (10, 15), (21, 0)]:
             self.assertIn(slot, s.checkin_slots)
         self.assertIn((10, 1), s.checkin_primary_slots)
         self.assertIn((21, 0), s.checkin_primary_slots)
 
     def test_next_fire_minute_granularity(self):
-        import qoder_scheduler as qs
-        s = qs.Scheduler.__new__(qs.Scheduler)
-        s.keepalive_hours = [22]
-        s.checkin_slots = [(9, 0), (10, 1), (10, 5), (21, 0)]
-        s.checkin_primary_slots = [(10, 1), (21, 0)]
-        s.all_hours = sorted(set([h for h, _ in s.checkin_slots] + [22]))
-        s.next_run_time = None
+        s = self._bare_scheduler([(9, 0), (10, 1), (10, 5), (21, 0)])
         # 09:30 时，下一个触发应是 10:01（分钟粒度），不是 10:00
         with frozen_time(ts(2025, 10, 20, 9, 30)):
             s._calc_next_fire()
             self.assertEqual(s.next_run_time, "2025-10-20 10:01:00")
 
-    def test_real_scheduler_defaults(self):
-        """真实 Scheduler 默认槽位必须含 10:01/10:05/10:15，且 09:00 仍在。"""
-        import qoder_scheduler as qs
-        import inspect
-        src = inspect.getsource(qs.Scheduler.__init__)
-        self.assertIn("(10, 1)", src)
-        self.assertIn("(10, 5)", src)
-        self.assertIn("(10, 15)", src)
-        self.assertIn("(21, 0)", src)
+    def test_default_slots_include_minute_granularity(self):
+        """默认槽位（配置层 DEFAULT_CHECKIN_SLOTS）必须含 10:01/10:05/10:15。"""
+        import qoder_settings as qset
+        slots = set(qset.DEFAULT_CHECKIN_SLOTS)
+        for expect in ("10:01", "10:05", "10:15", "21:00", "09:00"):
+            self.assertIn(expect, slots)
+        self.assertEqual(set(qset.DEFAULT_CHECKIN_PRIMARY_SLOTS),
+                         {"10:01", "21:00"})
 
 
 if __name__ == "__main__":

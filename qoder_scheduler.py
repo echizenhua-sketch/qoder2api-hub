@@ -34,37 +34,50 @@ CYCLE_HOUR = "hour"
 CYCLE_MANUAL = "manual"
 
 
+def _slot_to_tuple(value):
+    """'HH:MM' -> (时, 分)；非法值返回 None。"""
+    try:
+        text = str(value or "").strip()
+        hour, _, minute = text.partition(":")
+        hour, minute = int(hour), int(minute)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return (hour, minute)
+
+
+def qoder_settings_default_slots():
+    """代码内建的默认签到槽位（qoder_settings 不可用时的兜底）。"""
+    return ["09:00", "10:01", "10:05", "10:15",
+            "11:00", "12:00", "13:00", "14:00", "15:00",
+            "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"]
+
+
 class Scheduler(object):
     def __init__(self, pool, state_dir=None):
         self.pool = pool
         # 对齐社区默认排程 (本地时区 24 小时制)
         #
-        # 签到槽位：10:00 与 21:00。**09:00 已移除**——官方每日活动批次在
-        # 10:00（UTC+8）刷新（campaign 的 start_at 实测精确为 10:00:00，
-        # end_at 为次日 09:59:00）。09:00 去签拿到的是**上一批**（状态已
-        # CLAIMED），既领不到当天的分，还会因「上一批已领」的错误盖章把当天
-        # 10:00 之后的补签机会一并堵死。详见 qoder_accounts 的
+        # 签到槽位：分钟粒度 (时, 分)。**09:00 已从"主槽位"移出**——官方每日
+        # 活动批次在 10:00（UTC+8）刷新（campaign 的 start_at 实测精确为
+        # 10:00:00，end_at 为次日 09:59:00）。09:00 去签拿到的是**上一批**
+        # （状态已 CLAIMED），既领不到当天的分，还会因「上一批已领」的错误盖章
+        # 把当天 10:00 之后的补签机会一并堵死。详见 qoder_accounts 的
         # current_checkin_window_start() 说明。
         #
-        # 21:00 保留：给当天批次一次晚间兜底（也是「名额发完，次日 10:00
-        # 后重试」之外的最后机会）。
-        self.checkin_hours = [10, 21]
+        # 09:00 仍作为**普通补签槽位**保留：它是上一批关窗（09:59）前的最后
+        # 补领机会，批次感知后它不再污染本轮盖章。
+        #
+        # 槽位可由面板「配置 → 每日签到时间」维护，落盘在 accounts/settings.json
+        # （qoder_settings.CHECKIN_SLOTS_KEY），保存后由 reload_slots() 热更新，
+        # 无需重启容器。
         self.keepalive_hours = [22]      # 每日 22:00 集中 Token 保活
-        # 签到槽位 = (时, 分)。分钟粒度是必需的：上游批次在 10:00:00 整点
-        # 翻页，10:00:00 整点去签很可能仍看到上一批，所以主槽位放在 10:01，
-        # 另加 10:05 / 10:15 两次短重试，再逐小时重试到 20:00。
-        # 09:00 保留为「上一批的最后补领机会」——批次感知后它不再污染
-        # 本轮盖章（见 qoder_accounts.current_checkin_window_start）。
-        self.checkin_slots = [
-            (9, 0), (10, 1), (10, 5), (10, 15),
-            (11, 0), (12, 0), (13, 0), (14, 0), (15, 0),
-            (16, 0), (17, 0), (18, 0), (19, 0), (20, 0), (21, 0),
-        ]
-        # 主槽位（强制对全部账号发起一次领取尝试）。
-        # 非主槽位走「补签」语义：只对**本轮尚未领到**的账号发起（can_checkin）。
-        self.checkin_primary_slots = [(10, 1), (21, 0)]
-        self.all_hours = sorted(set([h for h, _ in self.checkin_slots]
-                                    + list(self.keepalive_hours)))
+        self._slots_lock = threading.RLock()
+        self.checkin_slots = []
+        self.checkin_primary_slots = []
+        self.all_hours = list(self.keepalive_hours)
+        self._load_slots()
         self._stop_event = threading.Event()
         self._thread = None
         self._run_lock = threading.Lock()
@@ -93,6 +106,75 @@ class Scheduler(object):
             self.log("调度器状态已从 %s 恢复（enabled=%s，上次运行 %s）"
                      % (self._state_path(), self.enabled,
                         self.last_run_time or "-"))
+
+    # -- 排程槽位（可由面板热更新） ----------------------------------------
+    def _accounts_dir(self):
+        """账号目录（槽位配置与账号池同处）。"""
+        return (getattr(self.pool, "dir", None) or self.state_dir
+                or os.environ.get("ACCOUNTS_DIR"))
+
+    def _load_slots(self):
+        """从 settings.json 读签到槽位；读不到就用代码内建默认值。"""
+        slots = None
+        primary = None
+        accounts_dir = getattr(self.pool, "dir", None)
+        if accounts_dir:
+            try:
+                import qoder_settings
+                slots = qoder_settings.checkin_slots(accounts_dir)
+                primary = qoder_settings.checkin_primary_slots(accounts_dir)
+            except Exception:
+                slots = None
+        if not slots:
+            slots = list(qoder_settings_default_slots())
+        self.checkin_slots = [_slot_to_tuple(s) for s in slots]
+        self.checkin_primary_slots = [_slot_to_tuple(s) for s in (primary or [])]
+        # 主槽位必须是签到槽位的子集（配置层已裁剪，这里再兜一次）
+        valid = set(self.checkin_slots)
+        self.checkin_primary_slots = [s for s in self.checkin_primary_slots
+                                      if s in valid]
+        self.all_hours = sorted(set([h for h, _ in self.checkin_slots]
+                                    + list(self.keepalive_hours)))
+
+    def reload_slots(self):
+        """重新从配置加载槽位（面板保存后调用；热更新，无需重启）。
+
+        返回 {"checkin_slots": [...], "checkin_primary_slots": [...],
+               "next_run_time": "..."}，供面板回显。
+        """
+        with self._slots_lock:
+            self._load_slots()
+            self._calc_next_fire()
+            # 已触发过的槽位若被移除，允许重新触发；新增槽位自然可触发。
+            # 注意 _fired_slots 混存两种形态：签到槽位 (时, 分) 与保活
+            # ("ka", 时) —— 后者不参与裁剪。
+            valid_slots = set(self.checkin_slots)
+            self._fired_slots = {
+                s for s in getattr(self, "_fired_slots", set())
+                if (isinstance(s, tuple) and len(s) == 2 and s[0] == "ka")
+                or s in valid_slots
+            }
+            self.log("排程槽位已更新：签到 %s（主槽位 %s），下次 %s"
+                     % (self.slots_text(), self.primary_slots_text(),
+                        self.next_run_time))
+        return self.slots_view()
+
+    def slots_text(self):
+        return "、".join("%02d:%02d" % s for s in self.checkin_slots)
+
+    def primary_slots_text(self):
+        return "、".join("%02d:%02d" % s for s in self.checkin_primary_slots)
+
+    def slots_view(self):
+        """面板可读的槽位视图（字符串形态，便于回显与编辑）。"""
+        with self._slots_lock:
+            return {
+                "checkin_slots": ["%02d:%02d" % s for s in self.checkin_slots],
+                "checkin_primary_slots": ["%02d:%02d" % s
+                                          for s in self.checkin_primary_slots],
+                "keepalive_hours": list(self.keepalive_hours),
+                "next_run_time": self.next_run_time,
+            }
 
     # -- 状态持久化 ---------------------------------------------------------
     def _state_path(self):
@@ -183,11 +265,15 @@ class Scheduler(object):
                     self._fired_slots_date = today
                 # 签到槽位：分钟粒度（10:01 / 10:05 / 10:15 / 整点…）。
                 # 用「(时,分) 精确命中 + 记录已触发槽位」避免同一分钟内重复触发。
+                # 读槽位时持锁：面板热更新（reload_slots）会整体替换列表。
+                with self._slots_lock:
+                    slots = list(self.checkin_slots)
+                    primary_slots = set(self.checkin_primary_slots)
                 slot = (cur_hour, cur_min)
-                if slot in self.checkin_slots and slot not in self._fired_slots:
+                if slot in slots and slot not in self._fired_slots:
                     self._fired_slots.add(slot)
                     reason = "签到排程命中 (%d:%02d)" % (cur_hour, cur_min)
-                    primary = slot in self.checkin_primary_slots
+                    primary = slot in primary_slots
                     try:
                         self._execute_cycle(reason, CYCLE_HOUR, checkin_primary=primary)
                     except Exception as exc:
@@ -207,11 +293,13 @@ class Scheduler(object):
     def _calc_next_fire(self):
         """下一个触发时刻（支持分钟粒度槽位）。"""
         now = time.localtime()
-        today = time.strftime("%Y-%m-%d")
+        with self._slots_lock:
+            slots = list(self.checkin_slots)
+            keepalive = list(self.keepalive_hours)
         candidates = []
-        for h, m in self.checkin_slots:
+        for h, m in slots:
             candidates.append((h, m, "签到"))
-        for h in self.keepalive_hours:
+        for h in keepalive:
             candidates.append((h, 0, "保活"))
         candidates.sort()
         for h, m, _kind in candidates:

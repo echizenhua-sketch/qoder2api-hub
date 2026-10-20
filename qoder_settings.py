@@ -606,3 +606,150 @@ def set_limit(accounts_dir, key, scope, value):
         data[LIMITS_KEY] = limits
         save(accounts_dir, data)
     return entry
+
+
+# ---------------------------------------------------------------------------
+# 每日签到时刻（面板「配置」可维护）
+# ---------------------------------------------------------------------------
+# 排程时刻存成 "HH:MM" 字符串列表，落盘在 accounts/settings.json 里，
+# 面板改完立即热更新调度器（Scheduler.reload_slots），无需重启容器。
+#
+# 为什么需要可配：官方每日活动批次在 10:00（UTC+8）开启，但**翻页时刻不保证
+# 精确**——不同日期可能差几十秒到几分钟。把 10:01/10:05/10:15 这类短重试
+# 交给用户按上游表现调整，比写死更省心；而「几点签到」本来就是部署相关的
+# 运维参数（不同机器的负载/上游抖动不同）。
+CHECKIN_SLOTS_KEY = "checkin_slots"
+# 主槽位的落盘键（与 CHECKIN_SLOTS_KEY 同文件）。
+CHECKIN_PRIMARY_SLOTS_KEY = "checkin_primary_slots"
+
+# 默认值与代码内建排程保持一致（含分钟粒度的短重试）。
+DEFAULT_CHECKIN_SLOTS = [
+    "09:00", "10:01", "10:05", "10:15",
+    "11:00", "12:00", "13:00", "14:00", "15:00",
+    "16:00", "17:00", "18:00", "19:00", "20:00", "21:00",
+]
+
+# 主槽位：对全部账号发起领取尝试（不按 can_checkin 过滤）。
+# 与默认值对齐：10:01 是批次开启后的首个主槽位，21:00 是当天兜底。
+DEFAULT_CHECKIN_PRIMARY_SLOTS = ["10:01", "21:00"]
+
+_SLOT_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def _normalize_slot(value):
+    """单个时刻 -> "HH:MM"（24 小时制、补零）；不合法返回 None。
+
+    接受 "9:0" / "09:00" / 930（int）/ "9点" 等宽松输入，但**只**接受
+    0-23 时、0-59 分——越界直接判非法（不静默纠正成别的时刻）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        # 纯数字：930 视作 9:30，9300 视作 09:30（HHMM 形式）
+        number = int(value)
+        if number < 0:
+            return None
+        if number > 2359:
+            return None
+        hour, minute = divmod(number, 100)
+        if minute > 59:
+            hour, minute = number // 60, number % 60
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace("点", ":").replace("时", ":").replace("分", "")
+        text = text.replace("：", ":")
+        if ":" not in text:
+            if not text.isdigit():
+                return None
+            number = int(text)
+            if number > 2359:
+                return None
+            hour, minute = divmod(number, 100)
+            if minute > 59:
+                hour, minute = number // 60, number % 60
+        else:
+            head, _, tail = text.partition(":")
+            if not head.strip().isdigit() or not tail.strip().isdigit():
+                return None
+            hour, minute = int(head.strip()), int(tail.strip())
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return "%02d:%02d" % (hour, minute)
+
+
+def normalize_checkin_slots(values, fallback=None):
+    """把任意输入规整成去重、升序的 "HH:MM" 列表。
+
+    非法项被**丢弃**（不抛异常）——面板上少配一个时刻不该让整个保存失败。
+    全空时返回 fallback（默认 DEFAULT_CHECKIN_SLOTS）。
+    """
+    fallback = list(fallback if fallback is not None else DEFAULT_CHECKIN_SLOTS)
+    if values is None:
+        return fallback
+    if isinstance(values, (str, bytes)):
+        values = [values]
+    if not isinstance(values, (list, tuple, set)):
+        return fallback
+    slots = set()
+    for item in values:
+        slot = _normalize_slot(item)
+        if slot:
+            slots.add(slot)
+    if not slots:
+        return fallback
+    return sorted(slots)
+
+
+def checkin_slots(accounts_dir):
+    """当前生效的签到时刻列表（未配置过时返回默认值）。"""
+    data = load(accounts_dir)
+    return normalize_checkin_slots(data.get(CHECKIN_SLOTS_KEY))
+
+
+def checkin_primary_slots(accounts_dir):
+    """主槽位列表（对全部账号发起尝试）。
+
+    主槽位**必须是签到时刻的子集**——否则面板会配出一个"主槽位"却不在
+    签到时刻里，永远不会触发。落在签到时刻之外的主槽位会被剔除。
+    """
+    data = load(accounts_dir)
+    raw = data.get(CHECKIN_PRIMARY_SLOTS_KEY)
+    slots = set(normalize_checkin_slots(raw, fallback=[])) if raw else set()
+    if not slots:
+        slots = set(DEFAULT_CHECKIN_PRIMARY_SLOTS)
+    valid = set(checkin_slots(accounts_dir))
+    return sorted(slots & valid)
+
+
+def set_checkin_slots(accounts_dir, values, primary=None):
+    """落盘签到时刻（与主槽位）；返回 (签到时刻, 主槽位)。
+
+    primary 为 None 时保留已存的主槽位（并按新签到时刻做子集裁剪）。
+    """
+    slots = normalize_checkin_slots(values)
+    with _lock:
+        data = load(accounts_dir)
+        if primary is None:
+            current = data.get(CHECKIN_PRIMARY_SLOTS_KEY)
+            prim = set(normalize_checkin_slots(
+                current, fallback=[])) if current else set(
+                    DEFAULT_CHECKIN_PRIMARY_SLOTS)
+        else:
+            prim = set(normalize_checkin_slots(primary, fallback=[]))
+        if not prim:
+            prim = set(DEFAULT_CHECKIN_PRIMARY_SLOTS)
+        prim &= set(slots)
+        if not prim:
+            # 主槽位被裁空时退回默认，再按新签到时刻裁一次
+            prim = set(DEFAULT_CHECKIN_PRIMARY_SLOTS) & set(slots)
+        if not prim:
+            # 极端情况：签到时刻里没有默认主槽位 -> 取最早的签到时刻当主槽位
+            prim = {slots[0]}
+        data[CHECKIN_SLOTS_KEY] = slots
+        data[CHECKIN_PRIMARY_SLOTS_KEY] = sorted(prim)
+        save(accounts_dir, data)
+    return slots, sorted(prim)

@@ -1061,6 +1061,27 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div id="keyList"></div>
     </section>
 
+    <section id="sectionCheckinSlots">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">每日签到时间 <em id="setSlotsState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+            每天在这些时刻自动签到领积分（本地时区）。官方每日活动批次在
+            <b>10:00（UTC+8）</b> 刷新，<b>建议保留 10:01 及之后的时刻</b>；
+            09:00 只是上一批的最后补领机会。分钟粒度可用（如 <b>10:05</b>），
+            用于批次翻页有延迟时短重试。
+            <br><b>主槽位</b>（加粗标记）会对全部账号发起领取尝试；其余槽位只补签本轮尚未领到的账号。
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="sec" onclick="addCheckinSlot()">+ 添加时刻</button>
+          <button id="btnSaveSlots" onclick="saveCheckinSlots(this)">保存签到时间</button>
+        </div>
+      </div>
+      <div id="checkinSlotList" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px"></div>
+      <div id="checkinSlotHint" style="font-size:12px;color:var(--dim)"></div>
+    </section>
+
     <section id="sectionLimits">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
         <div>
@@ -3563,6 +3584,8 @@ async function loadSettings(showToast){
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
     renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
+    renderCheckinSlots(data.checkin_slots || [], data.checkin_primary_slots || [],
+                       data.checkin_slots_effective || null);
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
@@ -3853,6 +3876,144 @@ async function saveApiKeys(btn){
     await postJSON('/settings/save', {api_keys: payload});
     toast('已保存 ' + payload.length + ' 个 Key', 'ok');
     loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+/* ---- 每日签到时间（面板「配置」可维护，保存后后端热更新调度器）----
+   槽位 = "HH:MM" 字符串列表；主槽位（加粗）会对全部账号发起领取尝试。 */
+let CHECKIN_SLOTS = [];            // [{slot:'10:01', primary:true}]
+let CHECKIN_SLOTS_LOADED = false;  // 没读到现有配置前不允许保存（避免覆盖成空）
+
+function slotTimeValid(text){
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(text || '').trim());
+  return !!m;
+}
+
+function normalizeSlotText(text){
+  const t = String(text || '').trim();
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(t);
+  if(!m) return t;
+  return m[1].padStart(2, '0') + ':' + m[2];
+}
+
+function renderCheckinSlots(slots, primary, effective){
+  const box = document.getElementById('checkinSlotList');
+  if(!box) return;
+  CHECKIN_SLOTS_LOADED = !!(slots && Array.isArray(slots));
+  const primSet = new Set((primary || []).map(normalizeSlotText));
+  const list = (slots || []).map(s => ({
+    slot: normalizeSlotText(s),
+    primary: primSet.has(normalizeSlotText(s)),
+  }));
+  // 后端返回的生效值（运行中调度器的实际槽位）与文件值可能因热更新延迟不同，
+  // 以生效值为准回显。
+  if(effective && Array.isArray(effective.checkin_slots) && effective.checkin_slots.length){
+    const effPrim = new Set((effective.checkin_primary_slots || []).map(normalizeSlotText));
+    list.length = 0;
+    effective.checkin_slots.forEach(s => list.push({
+      slot: normalizeSlotText(s), primary: effPrim.has(normalizeSlotText(s)),
+    }));
+  }
+  CHECKIN_SLOTS = list;
+  const stateEl = document.getElementById('setSlotsState');
+  if(stateEl){
+    stateEl.textContent = '(' + list.length + ' 个时刻)';
+    stateEl.style.color = list.length ? 'var(--accent2)' : 'var(--warn)';
+  }
+  const hint = document.getElementById('checkinSlotHint');
+  const next = effective ? effective.next_run_time : null;
+  if(hint){
+    hint.innerHTML = '下一次触发：<b class="mono">' + escapeHtml(next || '待调度') + '</b>'
+      + (effective && effective.keepalive_hours
+         ? '　·　Token 保活：每天 ' + effective.keepalive_hours.map(h => (h < 10 ? '0' : '') + h + ':00').join('、')
+         : '');
+  }
+  if(!list.length){
+    box.innerHTML = '<div class="empty" style="padding:12px 0">还没有签到时刻，点「+ 添加时刻」添加。</div>';
+    return;
+  }
+  box.innerHTML = list.map((item, idx) => {
+    const isPrimary = item.primary;
+    return '<span style="display:inline-flex;align-items:center;gap:4px;'
+      + 'background:var(--panel2);border:1px solid ' + (isPrimary ? 'var(--accent2)' : 'var(--line)')
+      + ';border-radius:8px;padding:3px 6px 3px 8px;">'
+      + '<input type="text" value="' + escapeHtml(item.slot) + '"'
+      + ' style="width:58px;background:transparent;border:none;color:var(--fg);font:inherit;'
+      + (isPrimary ? 'font-weight:700;' : '') + '"'
+      + ' onchange="onCheckinSlotEdit(' + idx + ', this.value, this)">'
+      + '<label style="display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--dim);cursor:pointer">'
+      + '<input type="checkbox" ' + (isPrimary ? 'checked' : '')
+      + ' onchange="onCheckinSlotPrimary(' + idx + ', this.checked)" title="主槽位：对全部账号发起领取尝试">主</label>'
+      + '<button class="sec mini" style="padding:1px 6px" title="删除"'
+      + ' onclick="removeCheckinSlot(' + idx + ')">&times;</button>'
+      + '</span>';
+  }).join('');
+}
+
+function onCheckinSlotEdit(idx, value, el){
+  const text = normalizeSlotText(value);
+  if(!slotTimeValid(text)){
+    el.style.color = 'var(--bad)';
+    toast('时刻格式应为 HH:MM（24 小时制）', 'warn');
+    return;
+  }
+  el.style.color = '';
+  CHECKIN_SLOTS[idx].slot = text;
+  // 同一时刻重复时提示但不阻断（后端会去重）。
+  const dup = CHECKIN_SLOTS.filter(s => s.slot === text).length > 1;
+  if(dup) toast('时刻 ' + text + ' 重复，保存时会自动去重', 'warn');
+}
+
+function onCheckinSlotPrimary(idx, checked){
+  CHECKIN_SLOTS[idx].primary = !!checked;
+}
+
+function removeCheckinSlot(idx){
+  CHECKIN_SLOTS.splice(idx, 1);
+  renderCheckinSlots(CHECKIN_SLOTS.map(s => s.slot),
+                    CHECKIN_SLOTS.filter(s => s.primary).map(s => s.slot), null);
+}
+
+function addCheckinSlot(){
+  if(!CHECKIN_SLOTS_LOADED){ toast('尚未读取现有配置，请先点「刷新」', 'warn'); return; }
+  CHECKIN_SLOTS.push({slot: '10:01', primary: false});
+  renderCheckinSlots(CHECKIN_SLOTS.map(s => s.slot),
+                    CHECKIN_SLOTS.filter(s => s.primary).map(s => s.slot), null);
+  const inputs = document.querySelectorAll('#checkinSlotList input[type=text]');
+  const last = inputs[inputs.length - 1];
+  if(last){ last.focus(); last.select(); }
+}
+
+async function saveCheckinSlots(btn){
+  if(!CHECKIN_SLOTS_LOADED){ toast('尚未读取现有配置，请先点「刷新」', 'warn'); return; }
+  const bad = CHECKIN_SLOTS.filter(s => !slotTimeValid(s.slot));
+  if(bad.length){
+    toast('有 ' + bad.length + ' 个时刻格式不对（应为 HH:MM）', 'bad');
+    return;
+  }
+  if(!CHECKIN_SLOTS.length){
+    toast('至少保留一个签到时刻', 'warn');
+    return;
+  }
+  const slots = CHECKIN_SLOTS.map(s => s.slot);
+  const primary = CHECKIN_SLOTS.filter(s => s.primary).map(s => s.slot);
+  if(btn) btn.disabled = true;
+  try {
+    const r = await postJSON('/settings/save', {
+      checkin_slots: slots,
+      checkin_primary_slots: primary,
+    });
+    const eff = r.checkin_slots_effective || null;
+    renderCheckinSlots(r.checkin_slots || slots, r.checkin_primary_slots || primary, eff);
+    if(r.checkin_slots_apply_error){
+      toast('已保存，但调度器热更新失败: ' + r.checkin_slots_apply_error, 'bad');
+    } else {
+      toast('签到时间已保存并立即生效（下次 ' + ((eff && eff.next_run_time) || '待调度') + '）', 'ok');
+    }
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
   } finally {

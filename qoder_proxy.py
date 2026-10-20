@@ -2033,6 +2033,13 @@ def runtime_settings_view():
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
+        # 每日签到时刻（面板「配置」可维护）。回显**运行中**调度器的实际
+        # 槽位（而非仅读文件），这样热更新后前端拿到的一定是生效值。
+        "checkin_slots": qoder_settings.checkin_slots(ACCOUNTS_DIR),
+        "checkin_primary_slots": qoder_settings.checkin_primary_slots(
+            ACCOUNTS_DIR),
+        "checkin_slots_effective": (SCHEDULER.slots_view()
+                                    if SCHEDULER else None),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
@@ -7770,6 +7777,30 @@ class Handler(BaseHTTPRequestHandler):
                 reply["limits_apply_error"] = str(exc)
                 log("quota limits apply failed after save: %s" % exc,
                     level="WARN")
+        if "checkin_slots" in payload:
+            # 每日签到时刻（面板「配置」可维护）。落盘 + 立即热更新调度器，
+            # 无需重启容器。非法项在 qoder_settings 里被丢弃而不是整单失败。
+            raw_slots = payload.get("checkin_slots")
+            raw_primary = payload.get("checkin_primary_slots")
+            if raw_slots is not None and not isinstance(raw_slots, (list, tuple)):
+                return self._error(400, "checkin_slots must be a list",
+                                   "invalid_request_error")
+            if raw_primary is not None \
+                    and not isinstance(raw_primary, (list, tuple)):
+                return self._error(400, "checkin_primary_slots must be a list",
+                                   "invalid_request_error")
+            slots, primary = qoder_settings.set_checkin_slots(
+                ACCOUNTS_DIR, raw_slots, primary=raw_primary)
+            reply["checkin_slots"] = slots
+            reply["checkin_primary_slots"] = primary
+            # 热更新：调度器重新加载槽位并刷新 next_run_time。
+            if SCHEDULER:
+                try:
+                    reply["checkin_slots_effective"] = SCHEDULER.reload_slots()
+                except Exception as exc:
+                    reply["checkin_slots_apply_error"] = str(exc)
+                    log("checkin slots hot-reload failed: %s" % exc,
+                        level="WARN")
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
