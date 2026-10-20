@@ -6098,6 +6098,57 @@ def _tools_for_chat(tools):
     return out
 
 
+def _flatten_namespace_tools(tools):
+    """Responses namespace tools -> flat chat functions.
+
+    Qoder upstream accepts only type=function.  Codex's multi_agent_v1 is a
+    client-executed namespace: flattening keeps it usable, and _ns_apply()
+    restores the namespace field on the way back (verified 2026-10-19).
+    Upstream-unsupported tool types (web_search, ...) are dropped with a WARN.
+    """
+    flat, ns_map = [], {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        ttype = t.get("type")
+        if ttype == "namespace":
+            ns = t.get("name") or ""
+            for nt in t.get("tools") or []:
+                if not isinstance(nt, dict) or nt.get("type") != "function":
+                    continue
+                name = nt.get("name") or ""
+                if not ns or not name:
+                    continue
+                item = dict(nt)
+                item["type"] = "function"
+                item["name"] = "%s__%s" % (ns, name)
+                flat.append(item)
+                ns_map[item["name"]] = {"namespace": ns, "name": name}
+            continue
+        if ttype == "function":
+            flat.append(t)
+            continue
+        if _is_custom_tool(t):
+            flat.append(_downgrade_custom_tool(t))
+            continue
+        log("responses: dropping unsupported tool type=%r name=%r"
+            % (ttype, t.get("name")), level="WARN", tag="responses")
+    return flat, ns_map
+
+
+def _ns_apply(ns_map, item):
+    """Map a flattened function name back to Codex's namespace shape."""
+    if not ns_map or not isinstance(item, dict):
+        return item
+    if item.get("type") not in ("function_call", "custom_tool_call"):
+        return item
+    info = ns_map.get(item.get("name") or "")
+    if info:
+        item["namespace"] = info["namespace"]
+        item["name"] = info["name"]
+    return item
+
+
 def _unwrap_custom_input(args):
     """Pull the freeform string back out of an {"input": "..."} argument blob."""
     if not isinstance(args, str):
@@ -6287,7 +6338,10 @@ def responses_to_chat(payload):
     if effort:
         chat["reasoning_effort"] = effort
     if payload.get("tools"):
-        chat["tools"] = _tools_for_chat(payload["tools"])
+        flat_tools, ns_map = _flatten_namespace_tools(payload["tools"])
+        chat["tools"] = flat_tools
+        if ns_map:
+            chat["_qd_ns_map"] = ns_map
     if payload.get("tool_choice"):
         chat["tool_choice"] = payload["tool_choice"]
     if payload.get("parallel_tool_calls") is not None:
@@ -6313,7 +6367,7 @@ def _responses_usage(u):
     }
 
 
-def chat_to_response(chat_obj, model, custom_names=None):
+def chat_to_response(chat_obj, model, custom_names=None, ns_map=None):
     """Fold a Chat Completions object into a Responses API response object.
 
     custom_names: the set of tool names the client declared as freeform.
@@ -6321,6 +6375,7 @@ def chat_to_response(chat_obj, model, custom_names=None):
     clients such as Codex recognise them.
     """
     custom_names = custom_names or set()
+    ns_map = ns_map or {}
     choice = (chat_obj.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     text = msg.get("content") or ""
@@ -6347,27 +6402,27 @@ def chat_to_response(chat_obj, model, custom_names=None):
                 "input": _unwrap_custom_input(fn.get("arguments") or ""),
             })
         else:
-            output.append({
+            output.append(_ns_apply(ns_map, {
                 "id": _new_id("fc_"),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
                 "arguments": fn.get("arguments") or "{}",
-            })
+            }))
     # DeepSeek DSML 工具调用回退
     if not (msg.get("tool_calls")):
         dsml_calls, clean_t = parse_dsml_tool_calls(text)
         if dsml_calls:
             for dc in dsml_calls:
-                output.append({
+                output.append(_ns_apply(ns_map, {
                     "id": _new_id("fc_"),
                     "type": "function_call",
                     "status": "completed",
                     "call_id": dc.get("id") or _new_id("call_"),
                     "name": dc.get("name") or "",
                     "arguments": dc.get("arguments") or "{}",
-                })
+                }))
             text = clean_t
     if text or not output:
         output.append({
@@ -6422,6 +6477,7 @@ def stream_responses_events(inner_lines, model, holder):
     text_buffer = ""
     dsml_tool_calls = []
     custom_names = set(holder.get("custom_names") or ())
+    ns_map = holder.get("ns_map") or {}
 
     def resp_obj(status):
         obj = {
@@ -6531,6 +6587,7 @@ def stream_responses_events(inner_lines, model, holder):
                     else:
                         item["type"] = "function_call"
                         item["arguments"] = ""
+                    _ns_apply(ns_map, item)
                     yield ev("response.output_item.added",
                              {"output_index": out_idx, "item": item})
                 else:
@@ -6700,14 +6757,14 @@ def stream_responses_events(inner_lines, model, holder):
                 "call_id": entry["id"],
                 "arguments": entry["arguments"],
             })
-            fc_item = {
+            fc_item = _ns_apply(ns_map, {
                 "id": entry["item_id"],
                 "type": "function_call",
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
                 "arguments": entry["arguments"],
-            }
+            })
         outputs[entry["output_index"]] = fc_item
         yield ev("response.output_item.done",
                  {"output_index": entry["output_index"], "item": fc_item})
@@ -6784,14 +6841,14 @@ def stream_responses_events(inner_lines, model, holder):
     if dsml_calls and not tool_calls_map:
         for dc in dsml_calls:
             out_idx = len(outputs)
-            fc_item = {
+            fc_item = _ns_apply(ns_map, {
                 "id": _new_id("fc_"),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": dc.get("id") or _new_id("call_"),
                 "name": dc.get("name") or "",
                 "arguments": dc.get("arguments") or "{}",
-            }
+            })
             outputs.append(fc_item)
             yield ev("response.output_item.added", {
                 "output_index": out_idx,
@@ -8324,6 +8381,7 @@ class Handler(BaseHTTPRequestHandler):
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
+                  "ns_map": chat_req.get("_qd_ns_map") or {},
                   "allowed_names": _tool_names_from_payload(chat_req)}
         try:
             req_realm = self._request_realm() or CURRENT_REALM
@@ -8492,7 +8550,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000))
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
-            result = chat_to_response(chat_obj, model, custom_names)
+            result = chat_to_response(chat_obj, model, custom_names,
+                                      ns_map=chat_req.get("_qd_ns_map") or {})
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
