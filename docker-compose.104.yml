@@ -1,0 +1,54 @@
+# 10.10.9.104 专用部署编排（不修改上游 docker-compose.yml）
+# 约束：
+#   1) 数据/日志全部落在项目目录内
+#   2) 显式指定 Docker 网段，避开 172.28/172.22/192.168
+services:
+  qoder-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    image: qoder2api-hub:104-local
+    container_name: qoder2api-hub
+    restart: unless-stopped
+    ports:
+      - "8793:8790"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8790
+      - TZ=Asia/Shanghai
+      - PANEL_PASSWORD=${PANEL_PASSWORD}
+    volumes:
+      - /home/liguanghua/qoder2api-hub/accounts:/app/accounts
+      - /home/liguanghua/qoder2api-hub/usage:/app/usage
+      - /home/liguanghua/qoder2api-hub/logs:/app/logs
+    # DNS：内网 DNS 192.168.2.201 实测 2.5% 失败、p95 2.7s，仅作最后兜底；
+    # 阿里/腾讯公共 DNS 实测 40/40 成功、延迟 <20ms，放在前面。
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+      - 192.168.2.201
+    dns_opt:
+      - "timeout:2"
+      - "attempts:2"
+      - "ndots:0"
+    # 日志重定向到项目目录；容器 stdout 关闭，避免日志落在 /var/lib/docker
+    command: ['sh', '-c', 'exec python qoder_proxy.py --lan --panel-password "$$PANEL_PASSWORD" >> /app/logs/qoder-proxy.log 2>&1']
+    logging:
+      driver: none
+    networks:
+      - qoder2api-hub-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/ping' % os.environ.get('PORT','8790'),timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  qoder2api-hub-net:
+    name: qoder2api-hub-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.88.170.0/24
