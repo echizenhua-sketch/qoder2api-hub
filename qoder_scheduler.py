@@ -38,9 +38,33 @@ class Scheduler(object):
     def __init__(self, pool, state_dir=None):
         self.pool = pool
         # 对齐社区默认排程 (本地时区 24 小时制)
-        self.checkin_hours = [9, 21]     # 每日 09:00、21:00 签到
+        #
+        # 签到槽位：10:00 与 21:00。**09:00 已移除**——官方每日活动批次在
+        # 10:00（UTC+8）刷新（campaign 的 start_at 实测精确为 10:00:00，
+        # end_at 为次日 09:59:00）。09:00 去签拿到的是**上一批**（状态已
+        # CLAIMED），既领不到当天的分，还会因「上一批已领」的错误盖章把当天
+        # 10:00 之后的补签机会一并堵死。详见 qoder_accounts 的
+        # current_checkin_window_start() 说明。
+        #
+        # 21:00 保留：给当天批次一次晚间兜底（也是「名额发完，次日 10:00
+        # 后重试」之外的最后机会）。
+        self.checkin_hours = [10, 21]
         self.keepalive_hours = [22]      # 每日 22:00 集中 Token 保活
-        self.all_hours = sorted(set(self.checkin_hours + self.keepalive_hours))
+        # 签到槽位 = (时, 分)。分钟粒度是必需的：上游批次在 10:00:00 整点
+        # 翻页，10:00:00 整点去签很可能仍看到上一批，所以主槽位放在 10:01，
+        # 另加 10:05 / 10:15 两次短重试，再逐小时重试到 20:00。
+        # 09:00 保留为「上一批的最后补领机会」——批次感知后它不再污染
+        # 本轮盖章（见 qoder_accounts.current_checkin_window_start）。
+        self.checkin_slots = [
+            (9, 0), (10, 1), (10, 5), (10, 15),
+            (11, 0), (12, 0), (13, 0), (14, 0), (15, 0),
+            (16, 0), (17, 0), (18, 0), (19, 0), (20, 0), (21, 0),
+        ]
+        # 主槽位（强制对全部账号发起一次领取尝试）。
+        # 非主槽位走「补签」语义：只对**本轮尚未领到**的账号发起（can_checkin）。
+        self.checkin_primary_slots = [(10, 1), (21, 0)]
+        self.all_hours = sorted(set([h for h, _ in self.checkin_slots]
+                                    + list(self.keepalive_hours)))
         self._stop_event = threading.Event()
         self._thread = None
         self._run_lock = threading.Lock()
@@ -58,6 +82,10 @@ class Scheduler(object):
         # 「启动补签」当日标记：进程重启 N 次，同一天最多补签 1 次
         self.startup_claim_date = str(st.get("startup_claim_date") or "")
         self.last_cycle_date = str(st.get("last_cycle_date") or "")
+        # 本轮已触发的槽位（防止同一分钟内重复触发）。跨日后要清空，
+        # 否则 (9,0) 这类槽位第二天就再也命中不了。
+        self._fired_slots = set()
+        self._fired_slots_date = time.strftime("%Y-%m-%d")
         self._calc_next_fire()
         # 把任务层失败（死端点、上游结构变化）也打进看板日志。
         set_logger(self.log)
@@ -148,32 +176,56 @@ class Scheduler(object):
             cur_hour = now.tm_hour
             cur_min = now.tm_min
             if self.enabled:
-                if cur_min == 0 and cur_hour in self.all_hours:
-                    reason = "整点排程命中 (%d:00)" % cur_hour
+                # 跨日：清空已触发槽位，否则 (9,0) 这类槽位次日不再命中。
+                today = time.strftime("%Y-%m-%d")
+                if today != self._fired_slots_date:
+                    self._fired_slots.clear()
+                    self._fired_slots_date = today
+                # 签到槽位：分钟粒度（10:01 / 10:05 / 10:15 / 整点…）。
+                # 用「(时,分) 精确命中 + 记录已触发槽位」避免同一分钟内重复触发。
+                slot = (cur_hour, cur_min)
+                if slot in self.checkin_slots and slot not in self._fired_slots:
+                    self._fired_slots.add(slot)
+                    reason = "签到排程命中 (%d:%02d)" % (cur_hour, cur_min)
+                    primary = slot in self.checkin_primary_slots
                     try:
-                        self._execute_cycle(reason, CYCLE_HOUR)
+                        self._execute_cycle(reason, CYCLE_HOUR, checkin_primary=primary)
                     except Exception as exc:
                         self.log("排程执行异常: %s" % exc)
                     time.sleep(65)   # 避开当前这一分钟重复触发
-            self._stop_event.wait(30)
+                elif (cur_hour in self.keepalive_hours and cur_min == 0
+                      and ("ka", cur_hour) not in self._fired_slots):
+                    self._fired_slots.add(("ka", cur_hour))
+                    try:
+                        self._execute_cycle("保活排程命中 (%d:00)" % cur_hour,
+                                            CYCLE_HOUR)
+                    except Exception as exc:
+                        self.log("排程执行异常: %s" % exc)
+                    time.sleep(65)
+            self._stop_event.wait(20)
 
     def _calc_next_fire(self):
+        """下一个触发时刻（支持分钟粒度槽位）。"""
         now = time.localtime()
-        cur_h = now.tm_hour
-        next_h = None
-        for h in self.all_hours:
-            if h > cur_h or (h == cur_h and now.tm_min == 0 and now.tm_sec < 10):
-                next_h = h
-                break
-        if next_h is not None:
-            t_struct = time.struct_time(
-                (now.tm_year, now.tm_mon, now.tm_mday, next_h, 0, 0, 0, 0, -1))
-        else:
-            t_tomorrow = time.time() + 86400
-            now_tom = time.localtime(t_tomorrow)
-            first_h = self.all_hours[0]
-            t_struct = time.struct_time(
-                (now_tom.tm_year, now_tom.tm_mon, now_tom.tm_mday, first_h, 0, 0, 0, 0, -1))
+        today = time.strftime("%Y-%m-%d")
+        candidates = []
+        for h, m in self.checkin_slots:
+            candidates.append((h, m, "签到"))
+        for h in self.keepalive_hours:
+            candidates.append((h, 0, "保活"))
+        candidates.sort()
+        for h, m, _kind in candidates:
+            if h > now.tm_hour or (h == now.tm_hour and m > now.tm_min):
+                t_struct = time.struct_time(
+                    (now.tm_year, now.tm_mon, now.tm_mday, h, m, 0, 0, 0, -1))
+                self.next_run_time = time.strftime("%Y-%m-%d %H:%M:%S", t_struct)
+                return
+        # 今天的槽位都过了 -> 明天第一个
+        t_tomorrow = time.time() + 86400
+        now_tom = time.localtime(t_tomorrow)
+        h, m, _kind = candidates[0]
+        t_struct = time.struct_time(
+            (now_tom.tm_year, now_tom.tm_mon, now_tom.tm_mday, h, m, 0, 0, 0, -1))
         self.next_run_time = time.strftime("%Y-%m-%d %H:%M:%S", t_struct)
 
     def trigger_now(self):
@@ -185,12 +237,13 @@ class Scheduler(object):
                          daemon=True).start()
         return {"ok": True, "msg": "已触发后台调度执行"}
 
-    def _execute_cycle(self, trigger_reason="周期巡检", cycle_kind=CYCLE_HOUR):
+    def _execute_cycle(self, trigger_reason="周期巡检", cycle_kind=CYCLE_HOUR,
+                       checkin_primary=None):
         if not self._run_lock.acquire(blocking=False):
             self.log("跳过本次巡检 (%s)：上一轮仍在执行" % trigger_reason)
             return
         try:
-            self._run_cycle(trigger_reason, cycle_kind)
+            self._run_cycle(trigger_reason, cycle_kind, checkin_primary)
         finally:
             self._run_lock.release()
 
@@ -211,7 +264,8 @@ class Scheduler(object):
         self._save_state()
         return True
 
-    def _run_cycle(self, trigger_reason="周期巡检", cycle_kind=CYCLE_HOUR):
+    def _run_cycle(self, trigger_reason="周期巡检", cycle_kind=CYCLE_HOUR,
+                   checkin_primary=None):
         self.last_run_time = time.strftime("%Y-%m-%d %H:%M:%S")
         self.last_cycle_date = time.strftime("%Y-%m-%d")
         self.log("开始执行任务 (%s)..." % trigger_reason)
@@ -222,7 +276,8 @@ class Scheduler(object):
 
         cur_hour = time.localtime().tm_hour
         keepalive_due = cur_hour in self.keepalive_hours
-        checkin_due = cur_hour in self.checkin_hours
+        # checkin_due 由 checkin_primary 参数决定（见下方「2. 每日签到」）。
+        # 保留 checkin_hours 仅作对外兼容/状态展示，实际槽位看 checkin_slots。
         allow_complement = self._allow_complement_checkin(cycle_kind)
 
         # 1. Token 保活：整点 22:00 全量刷新；其余巡检只刷新临近过期的
@@ -251,12 +306,26 @@ class Scheduler(object):
                      % (len(stale_uids),
                         "、".join(sorted(str(u)[:8] for u in stale_uids))))
 
-        # 2. 每日签到：整点签到窗口内执行；其余巡检只补签未签账号
-        #    （能力运行时探测：接口不存在的区域由 run_checkin 给出原因并跳过）
+        # 2. 每日签到
+        #    · 主槽位（10:01 / 21:00）: 对全部账号发起尝试（不看 can_checkin），
+        #      因为上游批次可能有延迟，主槽位值得无条件再撞一次；
+        #    · 其它槽位（10:05 / 10:15 / 逐小时重试）: 只对**本轮尚未领到**的
+        #      账号发起 —— can_checkin() 已是批次感知，领到后自然为 False，
+        #      没领到就继续重试，直到当天批次真正可领。
+        #    · 非签到槽位（保活 22:00 等）: 走补签语义，受启动闸门约束。
         targets = [a for a in self.pool.accounts
                    if a.enabled and a.access_token and a.uid not in stale_uids]
+        if checkin_primary is None:
+            # 非签到槽位：按是否处于签到小时粗判（保活轮不签到）
+            checkin_due = False
+        else:
+            checkin_due = True
         if checkin_due:
-            pending = targets          # 09:00 / 21:00 窗口不受启动闸门影响
+            if checkin_primary:
+                pending = targets          # 主槽位：全量尝试
+            else:
+                # 补签槽位：只打本轮还没领的
+                pending = [a for a in targets if a.can_checkin()]
         elif allow_complement:
             pending = [a for a in targets if a.can_checkin()]
         else:
@@ -269,10 +338,11 @@ class Scheduler(object):
             checkin_count = res["accounts_count"]
             earned = res.get("credit_added") or 0
             for line in res["logs"]:
-                if line.startswith("✓") or line.startswith("!"):
+                if line.startswith("✓") or line.startswith("!") \
+                        or line.startswith("·"):
                     self.log(line)
         elif checkin_due:
-            self.log("所有账号今日已签到")
+            self.log("所有账号本轮已签到")
 
         # 3. 刷新额度快照（看板积分卡片依赖）
         for acc in targets:
@@ -289,9 +359,9 @@ class Scheduler(object):
     def status(self):
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到 · 22:00 Token 保活)",
-            "mode_cn": "整点排程 (09:00/21:00 每日签到 · 22:00 Token 保活)",
-            "mode_intl": "整点排程 (09:00/21:00 每日签到 · 22:00 Token 保活)",
+            "mode": "批次感知排程 (10:01/10:05/10:15 签到 · 逐小时重试至 20:00 · 21:00 兜底 · 22:00 Token 保活)",
+            "mode_cn": "批次感知排程 (10:01/10:05/10:15 每日签到 · 逐小时重试至 20:00 · 21:00 兜底 · 22:00 Token 保活)",
+            "mode_intl": "批次感知排程 (10:01/10:05/10:15 每日签到 · 逐小时重试至 20:00 · 21:00 兜底 · 22:00 Token 保活)",
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
             "startup_claim_date": self.startup_claim_date or "",

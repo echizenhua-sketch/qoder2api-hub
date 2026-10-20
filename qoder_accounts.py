@@ -878,6 +878,78 @@ CHECKIN_WINDOW_HOUR_UTC8 = 10
 _UTC8 = datetime.timezone(datetime.timedelta(hours=8))
 
 
+def current_checkin_window_start(now=None):
+    """**今天这一轮**（今日 10:00 批次）的起点 epoch 秒。
+
+    官方规则（实测 campaign 的 start_at / end_at）：每日批次在 10:00（UTC+8）
+    开启，持续到次日 09:59。批次 key 的日期 = 该批次 start_at 的日期
+    （`act-20261020-894` -> start_at 2026-10-20 10:00）。
+
+    这里返回的是「**今天的日期**在 10:00 那一刻」的 epoch，**不做**减一天。
+    它是判定「今天这一轮的分领了没」的基准：
+      · 09:00（今天批次还没开启）-> 基准 = 今天 10:00；列表里还是**昨天**
+        那一批（已 CLAIMED），批次键 != 基准 -> 判「未领」-> 10:00 后可领。
+      · 11:00（今天批次已开启且已领）-> 基准 = 今天 10:00 == 活动批次键
+        -> 判「已领」-> 不再重复领取。
+      · 次日 01:00 -> 基准 = 次日 10:00，与昨天的活动批次不等 -> 判「未领」
+        （重复领取由上游幂等挡掉，无害）。
+
+    注意**不要**改成「不晚于 now 的最近一个 10:00」：那样 09:00 会把基准
+    算成昨天 10:00，与列表里的旧批次相等 -> 误判为「已领」-> 正是本次要修
+    的 bug（09:00 假成功把当天 10:00 之后的机会堵死）。
+    """
+    ts = time.time() if now is None else float(now)
+    now8 = datetime.datetime.fromtimestamp(ts, _UTC8)
+    boundary = now8.replace(hour=CHECKIN_WINDOW_HOUR_UTC8, minute=0,
+                            second=0, microsecond=0)
+    return int(boundary.timestamp())
+
+
+def active_checkin_window_start(now=None):
+    """**当前正在生效**的那一批次的起点 epoch 秒（[起点, 起点+24h) 窗口）。
+
+    与 current_checkin_window_start 的区别：09:00 时「正在生效」的是昨天
+    10:00 开启的那一批（它要到今天 09:59 才结束），而「今天这一轮」是
+    今天 10:00 才会开启的那一批。用于「这批的分是否已领」之外的场景
+    （如展示"本轮还剩多久"）。
+    """
+    ts = time.time() if now is None else float(now)
+    now8 = datetime.datetime.fromtimestamp(ts, _UTC8)
+    boundary = now8.replace(hour=CHECKIN_WINDOW_HOUR_UTC8, minute=0,
+                            second=0, microsecond=0)
+    if now8 < boundary:
+        boundary -= datetime.timedelta(days=1)
+    return int(boundary.timestamp())
+
+
+def campaign_batch_key(campaign, now=None):
+    """活动的「所属批次标识」——用它判断本地盖章是否属于同一轮。
+
+    优先用活动自己的 `start_at`（上游给的批次起点，最权威）；拿不到时退回
+    `campaignKey` 的日期段（`act-YYYYMMDD-NNN`）。两者都取不到则返回
+    当前窗口起点（保守：视为本轮，避免误判为「已领」而漏领）。
+
+    注意：不能用「当前时间所在窗口」当批次键——上游在 10:00:00 整点可能
+    还没翻页，此时列表里的活动仍是上一批（start_at = 昨天 10:00），
+    而当前窗口起点已是今天 10:00，两者不等 → 会把上一批误判成「本轮已领」
+    而跳过领取。用活动自己的 start_at 才能正确区分。
+    """
+    start = normalize_epoch((campaign or {}).get("start_at") or 0)
+    if start:
+        return start
+    key = str((campaign or {}).get("campaign_key") or "")
+    m = re.search(r"(\d{8})", key)
+    if m:
+        try:
+            d = datetime.datetime.strptime(m.group(1), "%Y%m%d")
+            # 批次开启时刻恒为该日 10:00（UTC+8）——不是当天 00:00。
+            d = d.replace(hour=CHECKIN_WINDOW_HOUR_UTC8, minute=0, second=0)
+            return int(d.replace(tzinfo=_UTC8).timestamp())
+        except Exception:
+            pass
+    return current_checkin_window_start(now)
+
+
 def next_checkin_window(now=None):
     """下一个「每日 10:00（UTC+8）」窗口 → (epoch 秒:int, 人类可读:str)。
 
@@ -1276,6 +1348,11 @@ class Account(object):
         self.degrade_until = 0.0            # 未知错误降权窗口截止（不挡 ready）
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
+        # 签到所属的**批次起点**（UTC+8 每日 10:00 的 epoch 秒）。老数据没有
+        # 这个字段时按 lastCheckin 反推（_infer_checkin_batch），保持向后兼容。
+        self.last_checkin_batch = int(data.get("lastCheckinBatch") or 0) or None
+        # 本轮 campaign_checkin 的临时标记：「已领到的其实是上一轮」时的说明。
+        # 每轮 campaign_checkin 开头重置（下面 self._stale_already_note = ""）。
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
         # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
         self.campaign_codes = dict(data.get("campaignCodes") or {})
@@ -1323,6 +1400,7 @@ class Account(object):
             "creditsDegraded": self.credits_degraded,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
+            "lastCheckinBatch": self.last_checkin_batch,
             "campaignCodes": self.campaign_codes,
             "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
@@ -1381,6 +1459,7 @@ class Account(object):
             "degradeFor": round(max(0.0, self.degrade_until - time.time())) or None,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
+            "lastCheckinBatch": self.last_checkin_batch,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
             "canCheckin": self.can_checkin(),
             "checkinCapability": ("unknown" if self.checkin_capability()[0] is None
@@ -2345,6 +2424,7 @@ class Account(object):
                     "next_available_note": next_note}
         claimed, already, earned, errors, blocked = [], [], 0, [], []
         pending, locked, codes, views = [], [], [], []   # 券/成就/详情类
+        self._stale_already_note = ""
         for c in st["campaigns"]:
             if only_kinds is not None:
                 kind = str((c.get("benefit") or {}).get("kind") or "").upper()
@@ -2397,7 +2477,9 @@ class Account(object):
             res = self.claim_campaign(cid)
             if res.get("ok"):
                 amount = res.get("amount") or c["benefit"]["amount"] or 0
-                self._stamp_checkin()
+                # 盖章带上**该活动自己的批次起点**（不是推测的当前窗口）——
+                # 否则 10:00 整点上游尚未翻页时会盖错批次。
+                self._stamp_checkin(campaign_batch_key(c, time.time()))
                 if res.get("replayed"):
                     already.append(c)
                 else:
@@ -2424,9 +2506,28 @@ class Account(object):
             # 每个 claim 请求之后统一等待一次：成功/被挡/失败都刚打过上游，
             # 相邻请求间隔由 gap 保证（默认 CLAIM_GAP_DEFAULT，防风控）。
             time.sleep(claim_gap)
-        if already and not self._checkin_stamped_today():
-            # #25-e：已有 CLAIMED 的签到类活动 = 今日已领 -> 本地盖章一次。
-            self._stamp_checkin()
+        # 「已领取」盖章：**只在本轮（当前 10:00 窗口）已领时才盖章**。
+        # 旧实现无条件盖章 → 09:00 领到的是**上一批**（已 CLAIMED）也照样盖成
+        # 当天日期，把 10:00 之后的领取机会一并堵死（issue：09:00 自动签到
+        # 永远 +0、必须手工点）。现在按活动自己的批次起点判定：
+        #   · 批次起点 >= 当前窗口起点 -> 属于本轮 -> 盖章；
+        #   · 批次起点 <  当前窗口起点 -> 属于上一轮 -> **不盖章**，
+        #     等本轮批次上线（10:00）后再来领。
+        if already:
+            now_ts = time.time()
+            current_batch = current_checkin_window_start(now_ts)
+            in_current = [c for c in already
+                          if campaign_batch_key(c, now_ts) >= current_batch]
+            if in_current and not self._checkin_stamped_today():
+                # #25-e：已有 CLAIMED 的签到类活动 = 本轮已领 -> 本地盖章一次。
+                self._stamp_checkin(max(campaign_batch_key(c, now_ts)
+                                        for c in in_current))
+            elif not in_current:
+                # 上一轮已领：明确告知是上一轮，且**不**盖章，保留本轮领取机会。
+                stale_keys = "、".join(self.campaign_label(c) for c in already)
+                self._stale_already_note = (
+                    "上一轮活动已领取（%s），本轮（每日 10:00 UTC+8 起）尚未领取"
+                    % stale_keys)
         if claimed:
             msg = "活动领取成功 +%d Credits（%s）" % (
                 earned, "、".join(self.campaign_label(c) for c in claimed))
@@ -2434,8 +2535,14 @@ class Account(object):
             msg = ("同人已领取：同一设备/身份下的其他账号本轮已领过（服务端按人去重，"
                    "failureCode=%s）" % blocked[0].get("failure_code"))
         elif already:
-            msg = "今日活动奖励已领取（%s）" % "、".join(
-                self.campaign_label(c) for c in already)
+            # 区分「本轮已领」与「上一轮已领」——两者文案必须不同：
+            # 旧实现一律写「今日活动奖励已领取」，把「上一批已领」（09:00 的
+            # 典型情形）表述成本轮成功，正是「日志说签到成功却 +0」的误导源。
+            if getattr(self, "_stale_already_note", ""):
+                msg = self._stale_already_note
+            else:
+                msg = "本轮活动奖励已领取（%s）" % "、".join(
+                    self.campaign_label(c) for c in already)
         elif pending:
             msg = ("名额已发完，次日 10:00 后可再领：%s（活动 %s）" % (
                 "、".join(c["required_achievement_key"] or "无门槛任务"
@@ -2476,8 +2583,47 @@ class Account(object):
 
 
     def _checkin_stamped_today(self):
-        """#25-e：本地今天是否已盖章（防重复写盘的短路判据）。"""
-        return str(self.last_checkin or "").startswith(time.strftime("%Y-%m-%d"))
+        """本地「本轮（当前 10:00 窗口）是否已盖章」——防重复写盘的短路判据。
+
+        旧实现按自然日（`%Y-%m-%d`）比较，与官方的 10:00 批次边界不一致，
+        会让 09:00 那次「上一批已领」的观测把当天 10:00 之后的领取机会一并
+        堵死（见 current_checkin_window_start 的说明）。
+
+        现在改为**批次感知**：
+          · 有 `lastCheckinBatch`（落盘的批次起点）-> 与当前窗口起点比较；
+          · 老数据没有该字段 -> 退回按 lastCheckin 的日期推算所属批次起点
+            （取当天 10:00；若 lastCheckin 时刻早于当天 10:00，则属于前一天
+            的批次），再与当前窗口起点比较。
+        这样 09:00 领到的「上一批」不会算作「本轮已领」，10:00 之后仍可重试。
+        """
+        batch = self.last_checkin_batch
+        if not batch:
+            batch = self._infer_checkin_batch(self.last_checkin)
+        if not batch:
+            return False
+        return int(batch) >= current_checkin_window_start()
+
+    @staticmethod
+    def _infer_checkin_batch(stamp):
+        """从旧的 lastCheckin 文本（'%Y-%m-%d %H:%M:%S'）反推它所属的批次起点。
+
+        批次起点恒为 10:00（UTC+8）。若签到时刻早于当天 10:00，则它属于
+        **前一天**的批次（因为前一窗口覆盖到当天 09:59）。反推不出来返回 0
+        （= 未盖章，允许领取）。
+        """
+        text = str(stamp or "").strip()
+        if not text:
+            return 0
+        try:
+            when = datetime.datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return 0
+        when = when.replace(tzinfo=_UTC8)
+        day = when.replace(hour=CHECKIN_WINDOW_HOUR_UTC8, minute=0,
+                            second=0, microsecond=0)
+        if when < day:
+            day -= datetime.timedelta(days=1)
+        return int(day.timestamp())
 
     def _note_quota_anomaly(self, raw, reason):
         """#25-d：记录一次「不可信的 quota 响应」并**保留旧快照**。
@@ -2511,8 +2657,18 @@ class Account(object):
                          % reason,
                 "anomaly": anomaly}
 
-    def _stamp_checkin(self):
+    def _stamp_checkin(self, batch=None):
+        """盖章：记录签到时刻 + 它所属的批次起点。
+
+        batch 传活动自己的 start_at（campaign_batch_key 的结果）。不传时
+        默认取「当前 10:00 窗口起点」——但那是**推测**，对「上一批已领」的
+        情形会盖错批次，所以调用方凡是知道活动批次的都必须显式传。
+        """
         self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+        if batch:
+            self.last_checkin_batch = int(batch)
+        else:
+            self.last_checkin_batch = current_checkin_window_start()
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
 

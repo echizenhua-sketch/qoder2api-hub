@@ -736,7 +736,17 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
                     f"（服务端按人去重，{codes}），本号本轮不再发放")
     elif camp.get("already"):
         keys = "、".join(qoder_accounts.campaign_label(c) for c in camp["already"])
-        logs.append(f"✓ [{name}] 今日活动奖励已领取（{keys}）")
+        # 「已领取」有两种来源，文案必须区分开（否则误导）：
+        #   · 本轮（10:00 窗口）已领 -> 用 ✓（确实领到过，只是本轮不必再领）；
+        #   · 上一轮已领、**本轮还没领** -> 用 · 并明确说「上一轮」，
+        #     让人知道本轮还欠着、后面会自动重试。旧实现一律写「今日活动奖励
+        #     已领取」+ ✓，把「上一批已领」说成本轮成功，正是「日志说签到成功
+        #     却 +0」的误导源（issue：09:00 自动签到永远拿不到积分）。
+        msg_text = str(camp.get("message") or "")
+        if "上一轮" in msg_text:
+            logs.append(f"· [{name}] {msg_text}")
+        else:
+            logs.append(f"✓ [{name}] 本轮活动奖励已领取（{keys}）")
         for item in camp.get("codes") or []:
             logs.append(f"🎟 [{name}] {item['campaign']} 兑换码：{item['code']}"
                         f"（官方活动页可扫码兑换）")
