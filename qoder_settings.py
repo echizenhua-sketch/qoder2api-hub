@@ -172,6 +172,8 @@ def _clean_key_entry(entry):
         # P1-4：每 Key 模型白名单（空列表 = 不限制）。**必须显式保留**——
         # 本函数是白名单式重建，漏掉即「保存时被静默丢弃」（limits 同型坑）。
         "models": _clean_model_patterns(entry.get("models")),
+        # issue #69：Key 备注（纯展示，不参与鉴权；同样必须显式保留）。
+        "note": str(entry.get("note") or "").strip()[:120],
     }
 
 
@@ -264,6 +266,22 @@ def set_auth_disabled(accounts_dir, disabled):
     with _lock:
         data = load(accounts_dir)
         data["auth_disabled"] = bool(disabled)
+        save(accounts_dir, data)
+
+
+def web_tools_enabled(accounts_dir):
+    """本地 web 工具开关（面板「设置 → 本地 web 工具」）。
+
+    默认关闭：这是唯一会**由模型驱动出网**的能力，必须显式开启。
+    环境变量 QD_WEB_TOOLS 优先于这里的持久化开关。
+    """
+    return load(accounts_dir).get("web_tools") is True
+
+
+def set_web_tools_enabled(accounts_dir, enabled):
+    with _lock:
+        data = load(accounts_dir)
+        data["web_tools"] = bool(enabled)
         save(accounts_dir, data)
 
 

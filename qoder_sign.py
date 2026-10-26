@@ -47,6 +47,7 @@ x-model-key 决定上游模型路由。会话按账号缓存，access token 轮�
 """
 import base64
 import hashlib
+import sys
 import hmac
 import json
 import os
@@ -519,10 +520,54 @@ def rsa_pkcs1v15_encrypt(plain: bytes, n: int = None, e: int = None) -> bytes:
 # ---------------------------------------------------------------------------
 # COSY 会话与签名
 # ---------------------------------------------------------------------------
-# COSY 协议版本：官方 0.4.3 客户端（qoder-agent-sdk / qoder-cn-agent-sdk）
-# 内置常量为 "1.1.64"（SDK 里 `s5="1.1.64"`，cosy-version 头与 payload 共用），
-# 旧值 "0.1.43" 来自更早的 CLI 版本。实测 1.1.64 可用于模型列表与推理。
-COSY_VERSION = "1.1.64"
+# COSY 协议版本：对齐官方 qodercli 1.1.75（cosy-version 头与 payload 共用）；
+# 支持 QD_COSY_VERSION 覆盖。
+COSY_VERSION = (os.environ.get("QD_COSY_VERSION") or "1.1.75").strip() or "1.1.75"
+# 官方 CLI 的推理/模型请求不设 User-Agent：签名 WASM 的头表里没有它，请求经
+# 打包的 undici fetch 发出，由 undici 补默认值 "undici"。
+COSY_USER_AGENT = "undici"
+# issue #64（逆向官方客户端）：官方请求层对所有请求注入 Cosy-MachineOS，
+# Cosy-MachineHostname 只在 infer-sse 场景带；QD_COSY_OS_HEADERS=0 可关。
+def _cosy_os_headers():
+    """是否带 machineos/hostname 请求头（issue #64，默认开）。"""
+    return str(os.environ.get("QD_COSY_OS_HEADERS") or "1").strip().lower() \
+        not in ("0", "off", "false", "no", "disable", "disabled")
+
+
+def _machine_hostname(uid):
+    """按账号稳定派生主机名（形如 DESKTOP-1A2B3C4）。"""
+    h = hashlib.md5(("hostname:" + (uid or "anonymous")).encode("utf-8")) \
+        .hexdigest()
+    return "DESKTOP-" + h[:7].upper()
+
+
+def _detect_machine_os():
+    """按当前运行系统与架构返回官方同款 {arch}_{platform}（共 6 种组合）。"""
+    import platform as _plat
+    arch = (_plat.machine() or "").strip().lower()
+    norm_arch = "aarch64" if arch in ("arm64", "aarch64") else "x86_64"
+    if sys.platform.startswith("win"):
+        norm_plat = "win32"
+    elif sys.platform == "darwin":
+        norm_plat = "darwin"
+    else:
+        norm_plat = "linux"
+    return "%s_%s" % (norm_arch, norm_plat)
+
+
+def _resolve_machine_os():
+    """解析 cosy-machineos：默认保持 Windows=x86_64_win32 / 其余=x86_64_linux
+    （避免 ARM/macOS 存量账号升级后设备指纹漂移）；QD_COSY_MACHINE_OS=auto 时按当前
+    系统与架构自动识别，也可直接指定任意值。"""
+    raw = (os.environ.get("QD_COSY_MACHINE_OS") or "").strip()
+    if raw.lower() == "auto":
+        return _detect_machine_os()
+    if raw:
+        return raw
+    return "x86_64_win32" if sys.platform.startswith("win") else "x86_64_linux"
+
+
+COSY_MACHINE_OS = _resolve_machine_os()
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 
@@ -550,6 +595,8 @@ class CosySession(object):
         self.machine_id = derive_id(self.uid, "machine")
         self.machine_token = derive_machine_token(self.uid)
         self.machine_type = derive_machine_type(self.uid)
+        # 稳定主机名（官方 infer-sse 会带；同账号永远同一个，跨账号不同）
+        self.machine_hostname = _machine_hostname(self.uid)
         self.access_token = access_token or ""
 
         self.temp_key = uuid.uuid4().hex[:16]                 # 16 ASCII -> AES-128
@@ -595,26 +642,33 @@ class CosySession(object):
 
     def headers(self, body: str, raw_url: str, model_key: str = "",
                 sse: bool = True, accept: str = "text/event-stream") -> dict:
-        """构造一次推理/模型接口的完整 COSY 签名头。"""
+        """构造一次推理/模型接口的完整 COSY 签名头（对齐 qodercli 1.1.75）。"""
         _, date, bearer = self.bearer(body, raw_url)
         h = {
-            "cosy-data-policy": "AGREE",
+            "cosy-data-policy": "agree",
             "content-type": "application/json",
-            "cosy-machinetype": self.machine_type,
+            "cosy-business-product": "cli",
+            "cosy-business-type": "agent",
+            "cosy-scene": "assistant",
             "cosy-clienttype": "5",
             "cosy-date": date,
             "cosy-user": self.uid,
             "cosy-key": self.cosy_key,
             "accept": accept,
-            "cosy-clientip": "169.254.198.161",
             "authorization": bearer,
             "accept-encoding": "identity",
             "cosy-version": COSY_VERSION,
             "cosy-machineid": self.machine_id,
             "cosy-machinetoken": self.machine_token,
+            "cosy-machinetype": self.machine_type,
+            "cosy-clientip": "169.254.198.161",
             "login-version": "v2",
-            "user-agent": "Go-http-client/2.0",
+            "user-agent": COSY_USER_AGENT,
         }
+        if _cosy_os_headers():
+            h["cosy-machineos"] = COSY_MACHINE_OS
+            if sse:
+                h["cosy-machinehostname"] = self.machine_hostname
         if sse:
             h["cache-control"] = "no-cache"
         if model_key:

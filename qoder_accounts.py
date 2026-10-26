@@ -15,12 +15,14 @@
 import base64
 import collections
 import datetime
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import socket
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -32,6 +34,7 @@ import uuid
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
+from qoder_sign import COSY_MACHINE_OS
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -45,7 +48,7 @@ REALM_CONFIGS = {
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
         "domain": "qoder.com.cn",
-        "ua": "QoderWork/1.1.64",
+        "ua": "QoderWork/1.1.75",
         # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
         # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
         # 每日领取活动搬到 campaign 平台后，任何区域都可能新增/下线接口。
@@ -61,13 +64,18 @@ REALM_CONFIGS = {
         "openapi": "https://openapi.qoder.sh",
         # 推理主机取自 0.4.3 客户端的 endpoint 缓存/内置候选（api1 主选，
         # api2/api3 为官方故障切换域名）：api1 连不上时按顺序切换。
-        "gateway": "https://api1.qoder.sh",
-        "gateway_fallbacks": ("https://api2.qoder.sh", "https://api3.qoder.sh"),
+        # issue #64（逆向官方 0.4.8 的 endpoint 缓存）：国际版把推理与“安全推理”
+        # 拆成两个集群——inference=api3、securityInference=api2；api1 已不在官方
+        # 候选首位（本机实测也常年超时）。这里按官方顺序对齐：api3 主、api2/api1 备。
+        "gateway": os.environ.get("QD_INTL_GATEWAY") or "https://api3.qoder.sh",
+        "gateway_fallbacks": ("https://api2.qoder.sh", "https://api1.qoder.sh"),
+        # 官方另有 securityInference 用途端点（intl=api2）；网关不主动调用，仅记录。
+        "security_inference": "https://api2.qoder.sh",
         "website": "https://qoder.com",
         "client_id": "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
         "redirect_uri": "qoder://aicoding.aicoding-agent/login-success",
         "domain": "qoder.com",
-        "ua": "Qoder/1.1.64",
+        "ua": "Qoder/1.1.75",
         # 国际版目前 /sash/api/v1/me/daily-check-in/* 返回 404（实测），但活动
         # 页面同样挂着"每日领取 100 Credits"。该字段仅作提示，门控靠运行时探测。
         "has_checkin": False,
@@ -106,12 +114,56 @@ PATH_CAMPAIGNS = "/sash/api/v1/me/campaigns"
 #        已领取返回 {"status":"CLAIMED","replayed":true}，不会重复发放）
 PATH_CAMPAIGN_REWARD = "/sash/api/v1/me/campaigns/%s/reward"
 PATH_CAMPAIGN_CLAIM = "/sash/api/v1/me/campaigns/%s/claim"
+# 官方积分消耗（0.4.3 客户端新增；cn/intl 实测均 200）：
+#   summary -> {totalCredits, peakCredits, peakDate, unit}
+#   heatmap -> {items: [{date, value}...]}（近 365 天，按天积分消耗）
+PATH_CREDIT_SUMMARY = "/sash/api/v1/ai-conversations/credits-summary"
+PATH_CREDIT_HEATMAP = "/sash/api/v1/ai-conversations/credits-heatmap"
+PATH_ACHIEVEMENTS = "/sash/api/v1/me/achievements"
 
 # 桌面端专用请求头（活动平台必需；CLI=5 / QoderWork=6 / 桌面端=10）
 DESKTOP_CLIENT_TYPE = "10"
-DESKTOP_CLIENT_VERSION = "0.4.3"      # 可用 QD_DESKTOP_VERSION 覆盖
-MACHINE_OS = "x86_64_win32"
-MACHINE_HOSTNAME = "DESKTOP-QODER"
+DESKTOP_CLIENT_VERSION = "0.4.8"      # 可用 QD_DESKTOP_VERSION 覆盖
+MACHINE_OS = COSY_MACHINE_OS          # 与推理链路共用同一取值
+
+# 主机名规整规则逐字复刻官方桌面端 / CLI：可打印 ASCII 原样用，否则先试 IDNA，
+# 再不行就把非法字符折成 "-" 并加 sha256 前 8 位；超过 96 字符截断加哈希。
+_HEADER_SAFE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+_HOSTNAME_MAX_LEN = 96
+_HOSTNAME_HASH_LEN = 8
+
+
+def _hostname_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:_HOSTNAME_HASH_LEN]
+
+
+def _cap_hostname(text):
+    if len(text) <= _HOSTNAME_MAX_LEN:
+        return text
+    head = re.sub(r"[-\s]+$", "", text[:_HOSTNAME_MAX_LEN - _HOSTNAME_HASH_LEN - 1])
+    return "%s-%s" % (head or "unknown", _hostname_hash(text))
+
+
+def _header_safe_hostname(raw):
+    """把主机名规整成可放进请求头的值；空主机名返回空串（此时不发该头）。"""
+    name = (raw or "").strip()
+    if not name:
+        return ""
+    if _HEADER_SAFE_RE.fullmatch(name):
+        return _cap_hostname(name)
+    try:
+        ascii_name = name.encode("idna").decode("ascii")
+    except UnicodeError:
+        ascii_name = ""
+    if ascii_name and _HEADER_SAFE_RE.fullmatch(ascii_name):
+        return _cap_hostname(ascii_name)
+    slug = re.sub(r"-{2,}", "-", re.sub(r"[^\x21-\x7e]+", "-", name)).strip("-")
+    return _cap_hostname("%s-%s" % (slug or "unknown", _hostname_hash(name)))
+
+
+# 官方桌面端在活动请求里发本机真实主机名（规整后）。Docker 每次重建容器
+# 主机名都会变，想固定可用 `docker run --hostname` / compose 的 hostname:。
+MACHINE_HOSTNAME = _header_safe_hostname(socket.gethostname())
 
 
 def desktop_version():
@@ -124,9 +176,9 @@ def desktop_version():
 # ---------------------------------------------------------------------------
 # 官方桌面端原生风控身份（activity/campaign 列表按它过滤，必须是"真"身份）
 # ---------------------------------------------------------------------------
-# 官方桌面端在调用活动平台前，会 spawn 自己的原生桥取机器身份：
-#     <install>/resources/umid/runtime-info.exe prod --account-stdin
-#     stdin: {"account": <uid>}   stdout: {"machineToken","machineType","machineCode",...}
+# 官方客户端在调用活动平台前，会 spawn 自己的原生桥取机器身份：
+#     <install>/resources/umid/runtime-info[.exe] <0|3> [--account-stdin]
+#     stdin: {"account": <uid>}\n（仅 darwin/win32）   stdout: {"machineToken","machineType","machineCode",...}
 # 服务端**按这些值过滤设备定向活动**：派生的假身份不会报错，但活动列表里
 # 会静默少掉"每日领取 100 Credits"这类条目（实测：换用原生身份后立刻出现
 # CLAIMABLE 活动）。因此网关优先调用同一个官方二进制取真值，失败才回退派生值。
@@ -190,20 +242,37 @@ def _read_ini(path, key):
 
 
 def desktop_install_dir(realm):
-    """桌面端安装目录（launcher state.ini 的 installDir；找不到返回空串）。"""
-    base = _localappdata()
+    """桌面端安装目录（Windows / macOS / Linux 全平台；找不到返回空串）。"""
     names = ("Qoder CN", "QoderCN", "Qoder") if realm == "cn" else ("Qoder",)
-    for name in names:
-        for launcher in ("%s Launcher" % name, "Launcher"):
-            ini = os.path.join(base, name, launcher, "state.ini")
-            if os.path.isfile(ini):
-                d = _read_ini(ini, "installDir")
-                if d and os.path.isdir(d):
+    if os.name == "nt":
+        base = _localappdata()
+        for name in names:
+            for launcher in ("%s Launcher" % name, "Launcher"):
+                ini = os.path.join(base, name, launcher, "state.ini")
+                if os.path.isfile(ini):
+                    d = _read_ini(ini, "installDir")
+                    if d and os.path.isdir(d):
+                        return d
+        for name in names:
+            for root in (os.path.join(base, "Programs"),
+                         os.environ.get("ProgramFiles") or ""):
+                if not root:
+                    continue
+                d = os.path.join(root, name)
+                if os.path.isdir(d):
                     return d
-    for name in names:
-        d = os.path.join(base, "Programs", name)
-        if os.path.isdir(d):
-            return d
+    elif sys.platform == "darwin":
+        home_apps = os.path.join(os.path.expanduser("~"), "Applications")
+        for app_root in ("/Applications", home_apps):
+            for name in names:
+                d = os.path.join(app_root, "%s.app" % name, "Contents")
+                if os.path.isdir(d):
+                    return d
+    else:
+        for name in names:
+            for cand in ("/opt/%s" % name, "/usr/share/%s" % name.lower()):
+                if os.path.isdir(cand):
+                    return cand
     return ""
 
 
@@ -211,10 +280,10 @@ def runtime_info_exe(realm):
     """定位 runtime-info 原生风控身份桥；找不到返回空串。
 
     查找顺序（先桌面客户端，再提取目录）：
-      1. <桌面客户端安装目录>/resources/umid/runtime-info.exe（Windows 桌面端）；
-      2. POSIX：$QD_UMID_DIR/runtime-info、<repo>/umid/runtime-info
-         （由 _install_umid.py 从 @qoder-ai/qodercli 提取；两者调用契约一致。
-          Windows 不参与此分支，保持原有桌面客户端路径逐字不变）。
+      1. <桌面客户端安装目录>/{resources,Resources}/umid/runtime-info[.exe]；
+      2. 提取目录 $QD_UMID_DIR、<repo>/umid：
+         - Windows：runtime-info.exe（需同目录存在 sgsdk.dll）；
+         - POSIX：runtime-info（由 _install_umid.py 提取）。
 
     可用 QD_NATIVE_IDENTITY=0 关闭（测试/受限环境不希望拉起客户端二进制时）。
     """
@@ -223,26 +292,38 @@ def runtime_info_exe(realm):
     if realm in _native_exe_cache:
         return _native_exe_cache[realm]
     found = ""
-    roots = [os.path.join(desktop_install_dir(realm), "resources", "umid")]
-    for root in roots:
-        cand = os.path.join(root, "runtime-info.exe")
-        if os.path.isfile(cand):
-            found = cand
-            break
-    if not found and os.name == "posix":
-        # 提取目录（_install_umid.py 的落地位置；Windows 不参与本分支，
-        # 保持原有桌面客户端路径逐字不变）：显式 QD_UMID_DIR 优先于约定目录。
+    inst_dir = desktop_install_dir(realm)
+    if inst_dir:
+        exe_names = ("runtime-info.exe",) if os.name == "nt" else ("runtime-info",)
+        for res_sub in ("resources", "Resources"):
+            root = os.path.join(inst_dir, res_sub, "umid")
+            for exe_name in exe_names:
+                cand = os.path.join(root, exe_name)
+                if os.path.isfile(cand):
+                    found = cand
+                    break
+            if found:
+                break
+    if not found:
         extracted = []
         umid_dir = (os.environ.get("QD_UMID_DIR") or "").strip()
         if umid_dir:
             extracted.append(umid_dir)
         extracted.append(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "umid"))
-        for root in extracted:
-            cand = os.path.join(root, "runtime-info")
-            if os.path.isfile(cand):
-                found = cand
-                break
+        if os.name == "nt":
+            for root in extracted:
+                cand = os.path.join(root, "runtime-info.exe")
+                dll = os.path.join(root, "sgsdk.dll")
+                if os.path.isfile(cand) and os.path.isfile(dll):
+                    found = cand
+                    break
+        else:
+            for root in extracted:
+                cand = os.path.join(root, "runtime-info")
+                if os.path.isfile(cand):
+                    found = cand
+                    break
     _native_exe_cache[realm] = found
     return found
 
@@ -264,14 +345,28 @@ def _runtime_info_warn(category, message):
         return
     _runtime_info_warned.add(category)
     try:
-        import sys
         print("[runtime-info] %s" % message, file=sys.stderr)
     except Exception:
         pass
 
 
+def _runtime_info_env(realm):
+    """返回传给 runtime-info 的环境码：国内版 ONLINE="0"，国际版 US_ONLINE="3"。
+
+    对齐官方桌面端 0.4.8 主进程（`region === "global" ? 3 : 0`）：这份身份只用于
+    桌面端同款的活动请求头，所以跟桌面端走；官方 CLI 国际版传的是 SINGAPORE=4。
+    可用 QD_RUNTIME_INFO_ENV 覆盖。"""
+    default = "3" if realm == "intl" else "0"
+    return (os.environ.get("QD_RUNTIME_INFO_ENV") or default).strip() or default
+
+
 def run_runtime_info(realm, account_id=""):
     """调用 runtime-info 原生桥，返回其 JSON（失败返回 {}）。
+
+    调用契约对齐官方桌面端 0.4.8 / CLI 1.1.75：argv 为按区域的数字环境码（见
+    _runtime_info_env）；
+    仅 darwin / win32 且有 account_id 时附带 --account-stdin，stdin 为
+    `{"account": <uid>}\\n`，其余情况 stdin 直接 EOF。
 
     account 为空串同样可用：机器身份是机器级的，活动平台之外（如虚拟化体检）
     不需要账号上下文。
@@ -283,11 +378,16 @@ def run_runtime_info(realm, account_id=""):
     exe = runtime_info_exe(realm)
     if not exe:
         return {}
+    cmd = [exe, _runtime_info_env(realm)]
+    stdin_bytes = b""
+    if sys.platform in ("darwin", "win32") and account_id:
+        cmd.append("--account-stdin")
+        stdin_bytes = (json.dumps({"account": account_id}, separators=(",", ":"))
+                       + "\n").encode("utf-8")
     try:
         import subprocess
         proc = subprocess.run(
-            [exe, "prod", "--account-stdin"],
-            input=json.dumps({"account": account_id or ""}).encode("utf-8") + b" ",
+            cmd, input=stdin_bytes,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25,
             cwd=os.path.dirname(exe))
         out = proc.stdout.decode("utf-8", "replace").strip()
@@ -304,7 +404,7 @@ def run_runtime_info(realm, account_id=""):
         _runtime_info_warn(
             "exec:" + type(exc).__name__,
             "无法执行 %s：%s: %s（组件存在但跑不起来；Docker/alpine 需要 "
-            "gcompat libstdc++ libgcc 兼容层，见 README 已知限制）"
+            "gcompat libstdc++ libgcc 兼容层，见 docs/troubleshooting.md 已知限制）"
             % (exe, type(exc).__name__, exc))
     except Exception as exc:
         # 其它失败（超时 / 输出不是 JSON / 非 OSError 异常）
@@ -395,7 +495,6 @@ def _identity_cache_ttl():
 def _identity_cache_log(level, message):
     """缓存事件输出到 stderr；去重由各调用点的标记控制。"""
     try:
-        import sys
         print("[machine-identity] %s: %s" % (level, message), file=sys.stderr)
     except Exception:
         pass
@@ -414,6 +513,7 @@ def _identity_entry_to_ident(entry):
     return {"machineToken": token, "machineType": mtype, "machineCode": code,
             "vm": bool(entry.get("vm")),
             "vm_info": vm_info,
+            "environment": str(entry.get("environment") or "").strip(),
             "source": str(entry.get("source") or MACHINE_IDENTITY_NATIVE)}
 
 
@@ -459,7 +559,7 @@ def _read_identity_cache_doc():
 
 
 def _load_identity_cache(realm, now, allow_expired=False):
-    """读落盘缓存；返回 ident dict 或 None（无 / 损坏 / 字段不全 / 过期）。"""
+    """读落盘缓存；返回 ident dict 或 None（无 / 损坏 / 字段不全 / 环境不符 / 过期）。"""
     entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
     if entry is None:
         return None
@@ -467,8 +567,11 @@ def _load_identity_cache(realm, now, allow_expired=False):
     if ident is None:
         _identity_cache_warn_corrupt("missing fields")
         return None
-    if not allow_expired and _identity_entry_expired(entry, _identity_cache_ttl(), now):
-        return None
+    if not allow_expired:
+        if ident.get("environment") != _runtime_info_env(realm):
+            return None
+        if _identity_entry_expired(entry, _identity_cache_ttl(), now):
+            return None
     return ident
 
 
@@ -479,7 +582,8 @@ def _identity_cache_expired_entry_exists(realm, now):
     （让"定期轮换"真的换出新身份，见 _purge_identity_seed）。
     """
     entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
-    if entry is None or _identity_entry_to_ident(entry) is None:
+    ident = _identity_entry_to_ident(entry) if entry is not None else None
+    if ident is None or ident.get("environment") != _runtime_info_env(realm):
         return False
     return _identity_entry_expired(entry, _identity_cache_ttl(), now)
 
@@ -510,12 +614,14 @@ def _save_identity_cache(realm, ident, force=False):
     另一个实例刚写入未过期的缓存，见设计 §4②"keeping cached"）。
     """
     global _identity_cache_diff_warned
+    expected_env = _runtime_info_env(realm)
     with _IDENTITY_CACHE_LOCK:
         doc = _read_identity_cache_doc()
         realms = doc.setdefault("realm", {})
         old_entry = realms.get(realm)
         old_ident = _identity_entry_to_ident(old_entry) if old_entry else None
         if (not force and old_ident is not None
+                and old_ident.get("environment") == expected_env
                 and not _identity_entry_expired(old_entry, _identity_cache_ttl(),
                                                 time.time())
                 and old_ident != ident):
@@ -526,6 +632,7 @@ def _save_identity_cache(realm, ident, force=False):
                     "identity cache differs from fresh component output; keeping cached")
             return old_ident
         entry = dict(ident)
+        entry["environment"] = expected_env
         entry["cached_at"] = time.time()
         realms[realm] = entry
         doc["version"] = 1
@@ -600,6 +707,7 @@ def _sample_identity(realm, account_id):
     return {"machineToken": token, "machineType": mtype, "machineCode": code,
             "vm": bool(vm_info.get("isVm")),
             "vm_info": vm_info,
+            "environment": _runtime_info_env(realm),
             "source": MACHINE_IDENTITY_NATIVE}
 
 
@@ -773,6 +881,8 @@ CHECKIN_PROBE_TTL = 6 * 3600
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
+# 官方积分消耗/成就属于全量聚合接口：缓存 5 分钟，别跟着面板轮询打
+CREDIT_USAGE_TTL = 300
 
 # 活动平台 claim 请求之间的默认间隔（秒）：调用方（qoder_tasks.run_checkin）的
 # gap 未透传时的安全默认，保持「>= 1.0s 防风控」语义（见 qoder_tasks 模块声明）。
@@ -801,6 +911,52 @@ SESSION_DEAD_MARKERS = ("TOKEN_EXPIRE", "12153", "Offline user session not found
 def session_dead(msg):
     s = str(msg or "")
     return any(m in s for m in SESSION_DEAD_MARKERS)
+
+
+_OPENAPI_404 = {}          # (realm, path) -> ts；已知该端点在此区域不存在
+_OPENAPI_404_TTL = 6 * 3600
+
+
+def openapi_missing(realm, path):
+    """该 (区域, 路径) 是否已被判定为 404（TTL 6h）。"""
+    ts = _OPENAPI_404.get((str(realm or "cn"), str(path or ""))) or 0
+    return (time.time() - ts) < _OPENAPI_404_TTL
+
+
+def mark_openapi_missing(realm, path):
+    _OPENAPI_404[(str(realm or "cn"), str(path or ""))] = time.time()
+
+
+def _machine_minimal_disabled():
+    raw = str(os.environ.get("QD_INTL_MACHINE_FALLBACK") or "").strip().lower()
+    return raw in ("0", "off", "false", "no", "disable", "disabled")
+
+
+def openapi_candidates(realm):
+    """该区域 openapi 基址候选（issue: 国际版签不到到）。
+
+    官方把业务端点都挂在 openapi 基址上；国际版历史上是 openapi.qoder.sh，
+    但该域名在部分网络/时期不可达，表现为「活动列表拿不到 -> 签到无效」。
+    这里给出候选顺序，调用方**只在连接失败或 404 时**换下一个，业务错误不重试。
+    """
+    cfg = get_realm_config(realm)
+    r = str(realm or "cn")
+    out = []
+    env = str(os.environ.get("QD_%s_OPENAPI" % r.upper()) or "").strip()
+    if env:
+        out.append(env.rstrip("/"))
+    base = str(cfg.get("openapi") or "").rstrip("/")
+    if base:
+        out.append(base)
+    domain = str(cfg.get("domain") or "").strip()
+    # 国际版活动平台另有一个可用入口 center.qoder.sh（0.4.3 客户端仍引用；实测
+    # intl=200 / cn=401），放在官网域名之前作为回退。
+    _extra = ("https://center.qoder.sh",) if r == "intl" else ()
+    for host in _extra + ((("https://openapi." + domain) if domain else ""),
+                          str(cfg.get("website") or "").rstrip("/")):
+        if host and host not in out:
+            out.append(host)
+    return out
 
 
 def get_realm_config(realm):
@@ -836,6 +992,14 @@ def normalize_epoch(value):
     if number > 1e11:      # 毫秒
         number /= 1000.0
     return int(number)
+
+
+def shared_unlimited(credits):
+    """共享池是否是「不设上限」（cap=-1，issue #67）。"""
+    if not isinstance(credits, dict):
+        return False
+    shared = credits.get("shared")
+    return bool(isinstance(shared, dict) and shared.get("unlimited"))
 
 
 def effective_remain(credits):
@@ -1225,7 +1389,7 @@ def _retryable(exc):
 # 现建 opener——没有「首次请求固化」，用户中途开关代理立即生效。
 #
 # 依赖系统代理才能上网的用户：设 HTTPS_PROXY=http://127.0.0.1:7897 即可恢复
-# （README「系统代理（Windows）」节有完整说明）；TUN / fake-ip 型代理（Clash
+# （docs/deployment.md「出口代理」节有完整说明）；TUN / fake-ip 型代理（Clash
 # 等）在网络层透明转发，无需任何设置。
 _PROXY_SCHEMES = (("https", ("HTTPS_PROXY", "https_proxy")),
                   ("http", ("HTTP_PROXY", "http_proxy")),
@@ -1260,6 +1424,24 @@ def _opener_for_request():
     """
     proxies = _proxy_map_from_env()
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def upstream_clock_skew(timeout=4.0):
+    """用上游 Date 头测本机时钟漂移（秒）。无鉴权、只发 HEAD、走代理感知 opener。
+
+    issue #64：COSY 签名带时间戳，容器时钟漂移会直接 401；这是「容器里莫名失效」
+    的常见原因，必须在启动自检里看得见。失败返回 None（fail-open）。
+    """
+    from email.utils import parsedate_to_datetime
+    try:
+        req = urllib.request.Request("https://openapi.qoder.com.cn/", method="HEAD")
+        with _opener_for_request().open(req, timeout=timeout) as resp:
+            date_hdr = resp.headers.get("Date")
+        if not date_hdr:
+            return None
+        return int(parsedate_to_datetime(date_hdr).timestamp() - time.time())
+    except Exception:
+        return None
 
 
 def http_json(url, data=None, method=None, headers=None, timeout=30,
@@ -1297,6 +1479,8 @@ class Account(object):
         self.path = path
         self.uid = str(data.get("uid") or "")
         self.nickname = str(data.get("nickname") or "")
+        # issue #69：账号备注（纯展示，不参与任何判定）
+        self.note = str(data.get("note") or "")
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
@@ -1359,6 +1543,14 @@ class Account(object):
         self.last_checkin_batch = int(data.get("lastCheckinBatch") or 0) or None
         # 本轮 campaign_checkin 的临时标记：「已领到的其实是上一轮」时的说明。
         # 每轮 campaign_checkin 开头重置（下面 self._stale_already_note = ""）。
+        # 面板展示：最近一次积分变化（签到 +100 / 消耗 -35）与时间
+        self.last_credits_delta = data.get("lastCreditsDelta")
+        try:
+            self.last_credits_delta_at = float(data.get("lastCreditsDeltaAt") or 0)
+        except (TypeError, ValueError):
+            self.last_credits_delta_at = 0.0
+        self._credit_usage_cache = None   # (ts, payload) 官方积分消耗
+        self._achievements_cache = None   # (ts, payload) 已获成就
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
         # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
         self.campaign_codes = dict(data.get("campaignCodes") or {})
@@ -1407,12 +1599,47 @@ class Account(object):
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
             "lastCheckinBatch": self.last_checkin_batch,
+            "lastCreditsDelta": self.last_credits_delta,
+            "lastCreditsDeltaAt": self.last_credits_delta_at,
             "campaignCodes": self.campaign_codes,
             "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
             "organizationId": self.organization_id,
             "organizationName": self.organization_name,
+            "note": self.note,
         }
+
+    def is_team(self):
+        """是否团队 / 企业账号（issue #90）。
+
+        判定与 proxy 侧 _is_team_account 同源，优先级：
+          1. userinfo 里带 organization_id / organization_name（OAuth 登录即有）；
+          2. userType 含 team / enterprise（PAT 导入等路径）；
+          3. 额度快照里有组织共享池（orgResourcePackage 等）。
+        三者任一命中即算——企业号即使 userType 是个人风格，只要挂了组织就算。
+        """
+        if str(self.organization_id or "").strip() or \
+                str(self.organization_name or "").strip():
+            return True
+        ut = str(self.user_type or "").lower()
+        if "team" in ut or "enterprise" in ut:
+            return True
+        cred = self.credits if isinstance(self.credits, dict) else {}
+        shared = cred.get("shared")
+        if isinstance(shared, dict) and (shared.get("size") or shared.get("unlimited")):
+            return True
+        for pkg in cred.get("packages") or []:
+            if isinstance(pkg, dict) and pkg.get("name") == "共享额度":
+                return True
+        return False
+
+    def org_label(self):
+        """企业/组织展示名（面板徽标用；没有组织返回空串）。"""
+        name = str(self.organization_name or "").strip()
+        if name:
+            return name
+        oid = str(self.organization_id or "").strip()
+        return ("org " + oid[:8]) if oid else ""
 
     def public(self):
         exp = self.expires_at
@@ -1468,6 +1695,12 @@ class Account(object):
             "lastCheckinBatch": self.last_checkin_batch,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
             "canCheckin": self.can_checkin(),
+            "isTeam": self.is_team(),
+            "orgLabel": self.org_label(),
+            "checkedInToday": self._checkin_stamped_today(),
+            "lastCheckinDate": str(self.last_checkin or "")[:10],
+            "lastCreditsDelta": self.last_credits_delta,
+            "lastCreditsDeltaAt": self.last_credits_delta_at,
             "checkinCapability": ("unknown" if self.checkin_capability()[0] is None
                                   else ("available" if self.checkin_capability()[0]
                                         else "not_found")),
@@ -1475,6 +1708,10 @@ class Account(object):
             "userType": self.user_type,
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
+            # issue #74：#69 只给 to_dict（写文件/导出）加了 note，public()
+            # （面板 /accounts 的数据源）漏了——保存后当场能看见，15 秒后
+            # 轮询覆盖就消失。纯展示字段，加进来没有副作用。
+            "note": self.note,
         }
 
     def save(self, directory):
@@ -1542,6 +1779,10 @@ class Account(object):
             return False
         # issue #39：团队账号「套餐已用满 + 共享池仍有余额」按有效余额判定，
         # 否则共享额度白有、账号被误停。
+        if shared_unlimited(cred):
+            # issue #67：组织共享池 cap=-1（不设上限）——地板护栏不该拦，
+            # 而且必须是**显式**语义，不能靠「数字很大所以碰巧没触发」。
+            return False
         remain = effective_remain(cred)
         if remain is None:
             return False
@@ -1719,6 +1960,11 @@ class Account(object):
             return False
         cred = self.credits
         # issue #39：团队账号可能套餐 remain=0 但共享池仍有余额——按有效余额解封。
+        if shared_unlimited(cred):
+            # issue #67：无限共享池 = 有可用额度，402 停放应立即解除。
+            self.balance_until = 0.0
+            self.balance_reason = ""
+            return True
         remain = effective_remain(cred)
         try:
             if remain is None or float(remain) <= 0:
@@ -1860,7 +2106,7 @@ class Account(object):
             # （Go 语言 HTTP 客户端的默认值 "Go-http-client/2.0"），而 Qoder
             # 官方客户端是 Electron/Node 应用，绝不可能发出这个 UA —— 等于在
             # 每个 openapi 请求上自报「我是脚本」。REALM_CONFIGS 里本来就有
-            # 官方 UA（CN: QoderWork/1.1.64，INTL: Qoder/1.1.64），直接用。
+            # 按区域的官方 UA（CN: QoderWork/…，INTL: Qoder/…），直接用。
             "User-Agent": cfg.get("ua") or CLIENT_UA,
             "Authorization": "Bearer " + self.access_token,
             "X-Request-ID": generate_request_id(self.uid),
@@ -1870,16 +2116,20 @@ class Account(object):
             "Referer": cfg["website"] + "/",
         }
 
-    def desktop_headers(self):
-        """桌面端 0.4.3 同款出站头（活动平台 /sash/... 必需）。
+    def desktop_headers(self, minimal=False):
+        """桌面端同款出站头（活动平台 /sash/... 必需）。
 
-        官方桌面端调用 `/sash/api/v1/me/campaigns` 时携带：
-          Authorization: Bearer <token>
+        对齐官方桌面端 0.4.8 主进程调用 `/sash/api/v1/me/campaigns` 的完整头集合
+        （createRequestHeaders + createAuthorizedHeaders），不多不少：
+          Accept: application/json
           User-Agent: Qoder
+          Authorization: Bearer <token>
           Cosy-ClientType: 10（桌面端；CLI 是 5、QoderWork 是 6）
           Cosy-Version: <桌面端版本>
-          Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
-          MachineType / MachineCode
+          Cosy-MachineOS / MachineHostname（本机主机名）/ MachineId /
+          MachineToken / MachineType / MachineCode
+        没有 Content-Type / X-Request-ID / X-Machine-ID / Origin / Referer；
+        带请求体的调用（claim）由调用方自行补 Content-Type。
 
         两层坑（都已踩过）：
           1. 缺 UA / cosy-clienttype / cosy-version → 服务端不报错但返回
@@ -1897,11 +2147,16 @@ class Account(object):
             六头，只发 UA / cosy-clienttype / cosy-version。
         machine_identity_source 依旧如实记录（看板与诊断在用）。
         """
-        h = dict(self.headers())
-        h["User-Agent"] = "Qoder"
-        h["cosy-clienttype"] = DESKTOP_CLIENT_TYPE
-        h["cosy-version"] = desktop_version()
-        ident = native_machine_identity(self.realm, self.uid)
+        h = {
+            "Accept": "application/json",
+            "User-Agent": "Qoder",
+            "Authorization": "Bearer " + self.access_token,
+            "cosy-clienttype": DESKTOP_CLIENT_TYPE,
+            "cosy-version": desktop_version(),
+        }
+        ident = native_machine_identity(self.realm, self.uid) or {}
+        # 原生桥失败时可能返回 None（容器里常见）：当空 dict 处理，
+        # 走 derived 分支，而不是崩在 ident.get。
         if ident.get("machineToken"):
             # 仅原生身份可用时发送机器头（issue #10：派生六头会被服务端判定
             # 为非官方客户端并整条过滤 CLAIMABLE 活动；详见上方 docstring）。
@@ -1913,12 +2168,20 @@ class Account(object):
             h["cosy-machinecode"] = ident.get("machineCode") or \
                 derive_id(self.uid, "machinecode")
             h["cosy-machineos"] = MACHINE_OS
-            h["cosy-machinehostname"] = MACHINE_HOSTNAME
+            if MACHINE_HOSTNAME:
+                h["cosy-machinehostname"] = MACHINE_HOSTNAME
             self.machine_headers_state = MACHINE_HEADERS_NATIVE
         else:
-            # 无原生桥：一个机器头都不发（issue #10）。状态如实登记，供
+            # 无原生桥：默认一个机器头都不发（issue #10）。状态如实登记，供
             # campaigns().machine_headers 与 INTL 已知限制提示使用。
             self.machine_headers_state = MACHINE_HEADERS_OMITTED
+            if minimal and not _machine_minimal_disabled():
+                # issue: intl 签不到到的兜底 —— 实测「只发 os+hostname」时活动列表
+                # 仍可见（六头全发才会被判定为非官方客户端）。仅在
+                # showCampaign=false 时用一次，属于「让列表回来」的最小代价。
+                h["cosy-machineos"] = MACHINE_OS
+                if MACHINE_HOSTNAME:
+                    h["cosy-machinehostname"] = MACHINE_HOSTNAME
         self.machine_identity_source = ident.get("source") or "derived"
         return h
 
@@ -2048,26 +2311,25 @@ class Account(object):
         接口在本区域不存在时返回 (False, {"unavailable": True, reason:...})，
         并记录能力探测结果（活动上线后 TTL 到期会自动重探）。
         """
-        cfg = get_realm_config(self.realm)
-        url = cfg["openapi"] + PATH_CHECKIN_STATUS
-        try:
-            q = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=2)
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
-            if exc.code in (404, 405, 410):
+        # issue: 国际版签不到到 —— 基址走候选（openapi.qoder.sh 在部分网络不可达），
+        # 只在连接失败 / 404 时换下一个，业务 4xx 不换。
+        q, _code, _err = self._openapi_json(PATH_CHECKIN_STATUS,
+                                            headers=self.headers(),
+                                            timeout=8, retries=1,
+                                            fallback=False)
+        if q is None:
+            body = _err or ""
+            if _code in (404, 405, 410):
+                mark_openapi_missing(self.realm, PATH_CHECKIN_STATUS)
                 self._mark_checkin_capability(
-                    False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, exc.code))
+                    False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, _code))
                 return False, {
                     "unavailable": True,
                     "reason": CHECKIN_REASON_NOT_FOUND,
-                    "http": exc.code,
-                    "error": "HTTP %d %s" % (exc.code, body[:160]),
+                    "http": _code,
+                    "error": "HTTP %d %s" % (_code, body[:160]),
                 }
-            if exc.code == 403:
+            if _code == 403:
                 # issue #40：403 多为**出口/WAF 拦截**（国际版该接口本来就不存在，
                 # 正常应 404）。不写能力缓存（下次仍重探），给出可读原因——
                 # 面板显示「上游拒绝访问」而不是一句裸 HTTP 403。
@@ -2079,9 +2341,7 @@ class Account(object):
                     "error": "HTTP 403 %s" % body[:160],
                 }
             return False, {"unavailable": False,
-                           "error": "HTTP %d %s" % (exc.code, body[:160])}
-        except Exception as exc:
-            return False, {"unavailable": False, "error": str(exc)}
+                           "error": "HTTP %s %s" % (_code or "?", body[:160])}
         self._mark_checkin_capability(True, "")
         last = ""
         if q.get("lastClaimedAt"):
@@ -2132,24 +2392,21 @@ class Account(object):
             # 不发起无意义的 claim，按"活动未开放"成功跳过。
             return {"ok": True, "disabled": True, "status": st.get("status"),
                     "msg": "官方签到活动未开放 (status=%s)" % (st.get("status") or "?")}
-        cfg = get_realm_config(self.realm)
-        url = cfg["openapi"] + PATH_CHECKIN_CLAIM
-        try:
-            res = http_json(url, data=b"{}", method="POST",
-                            headers=self.headers(), timeout=15, retries=1)
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
+        # 同上：基址走候选（只在连接失败/404 时换下一个）
+        res, _code, _err = self._openapi_json(PATH_CHECKIN_CLAIM, method="POST",
+                                              data=b"{}",
+                                              headers=self.headers(),
+                                              timeout=15, retries=1,
+                                              fallback=False)
+        if res is None:
+            body = _err or ""
             # 上游并发/重复领取返回 409 ALREADY_CLAIMED —— 归一化为“已签”
             if "ALREADY_CLAIMED" in body:
                 self._stamp_checkin()
                 self._refresh_credits_quietly()
                 return {"ok": True, "already": True, "msg": "今日已签到"}
-            return {"ok": False, "error": "HTTP %d %s" % (exc.code, body[:160])}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": "HTTP %s %s"
+                    % (_code or "?", body[:160])}
         if str(res.get("result") or "") == "ALREADY_CLAIMED" or res.get("success") is False and "ALREADY" in str(res.get("error") or ""):
             self._stamp_checkin()
             self._refresh_credits_quietly()
@@ -2170,6 +2427,71 @@ class Account(object):
         return {"ok": True, "msg": "签到成功 +%d 积分" % reward,
                 "reward_credits": reward}
 
+    def fetch_credit_usage(self, days=365, force=False):
+        """官方积分消耗（0.4.3 客户端新增接口）。
+
+        返回 {ok, total, peak, peak_date, daily:[{date, value}], unit, error?}：
+          total      —— 窗口内累计消耗积分（官方口径，不是我们的 token 估算）
+          peak       —— 单日峰值；peak_date 对应日期
+          daily      —— 逐日消耗，可直接画热力图
+        结果缓存 CREDIT_USAGE_TTL 秒（该接口是全量聚合，别跟着 5 秒轮询打）。
+        """
+        now = time.time()
+        if not force and self._credit_usage_cache \
+                and now - self._credit_usage_cache[0] < CREDIT_USAGE_TTL:
+            return self._credit_usage_cache[1]
+        q_sum, code, err = self._openapi_json(PATH_CREDIT_SUMMARY,
+                                              headers=self.desktop_headers(),
+                                              timeout=15, retries=1)
+        if not isinstance(q_sum, dict):
+            out = {"ok": False, "error": err or ("HTTP %s" % code),
+                   "total": 0, "peak": 0, "peak_date": "", "daily": [],
+                   "unit": "credits"}
+            self._credit_usage_cache = (now, out)
+            return out
+        q_heat, _c2, _e2 = self._openapi_json(PATH_CREDIT_HEATMAP,
+                                              headers=self.desktop_headers(),
+                                              timeout=20, retries=1)
+        daily = []
+        if isinstance(q_heat, dict):
+            for item in (q_heat.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    daily.append({"date": str(item.get("date") or ""),
+                                  "value": float(item.get("value") or 0)})
+                except (TypeError, ValueError):
+                    continue
+        out = {
+            "ok": True,
+            "total": float(q_sum.get("totalCredits") or 0),
+            "peak": float(q_sum.get("peakCredits") or 0),
+            "peak_date": str(q_sum.get("peakDate") or ""),
+            "unit": str(q_sum.get("unit") or "credits"),
+            "daily": daily[-int(days):] if days else daily,
+        }
+        self._credit_usage_cache = (now, out)
+        return out
+
+    def fetch_achievements(self, force=False):
+        """已获得的成就 key 列表（用于解释活动「需先完成某成就」）。"""
+        now = time.time()
+        if not force and self._achievements_cache \
+                and now - self._achievements_cache[0] < CREDIT_USAGE_TTL:
+            return self._achievements_cache[1]
+        q, code, err = self._openapi_json(PATH_ACHIEVEMENTS,
+                                          headers=self.headers(),
+                                          timeout=15, retries=1)
+        keys = []
+        if isinstance(q, dict):
+            for item in (q.get("achievements") or []):
+                if isinstance(item, dict) and item.get("achievementKey"):
+                    keys.append(str(item["achievementKey"]))
+        out = {"ok": isinstance(q, dict), "keys": keys,
+               "error": "" if isinstance(q, dict) else (err or ("HTTP %s" % code))}
+        self._achievements_cache = (now, out)
+        return out
+
     def _refresh_credits_quietly(self):
         """签到/领奖后顺手刷新余额（best-effort，绝不抛）。"""
         try:
@@ -2177,33 +2499,65 @@ class Account(object):
         except Exception:
             return {"ok": False, "error": "credits refresh after checkin failed"}
 
+    def _openapi_json(self, path, method="GET", headers=None, data=None, fallback=True,
+                      timeout=15, retries=1):
+        """按 openapi 候选基址依次请求（仅连接失败/404 换下一个）。
+
+        返回 (payload|None, code, error)。业务 4xx（401/403/429）不换基址——
+        那说明地址是对的，只是这次被拒。fallback=False 时只探主基址（legacy
+        端点在国际版必然 404，多探一个基址就是白等一个 RTT）。
+        """
+        last = (None, 0, "no openapi candidate")
+        # 已知 404：直接返回（否则 intl 的 legacy 端点每次都要 0.x~10s 才失败，
+        # 签到因此慢到不可用；TTL 6h 后允许重探，端点上线仍能被发现）。
+        if openapi_missing(self.realm, path):
+            return None, 404, "cached 404 (known missing in %s)" % self.realm
+        tried = 0
+        _bases = openapi_candidates(self.realm)
+        if not fallback:
+            _bases = _bases[:1]
+        for base in _bases:
+            url = base + path
+            tried += 1
+            try:
+                return http_json(url, method=method, headers=headers,
+                                 data=data, timeout=timeout,
+                                 retries=retries), 200, ""
+            except urllib.error.HTTPError as exc:
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8", "replace")
+                except Exception:
+                    pass
+                last = (None, exc.code, "HTTP %d %s" % (exc.code, body[:120]))
+                if exc.code in (404, 405, 410):
+                    if tried >= 2:
+                        mark_openapi_missing(self.realm, path)
+                        return last
+                    continue          # 首个基址 404：再试一个候选
+                return last
+            except Exception as exc:
+                last = (None, 0, "%s @ %s" % (str(exc)[:100], base))
+                continue              # 连接层失败：换下一个基址
+        return last
+
+
     def _campaigns_get(self):
-        """一次活动列表请求（桌面端头 → 401/403 回退普通头）。
+        """一次活动列表请求（桌面端头 -> 401/403 回退普通头，基址走候选）。
 
         返回 (payload|None, http_code, error_str)；payload 为服务端 JSON。
         """
-        url = get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS
-        try:
-            return http_json(url, method="GET", headers=self.desktop_headers(),
-                             timeout=15, retries=1), 200, ""
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
-            # 桌面端头被拒（401/403）时回退普通头，至少保留"能不能看到"的信息
-            if exc.code in (401, 403):
-                try:
-                    return http_json(url, method="GET", headers=self.headers(),
-                                     timeout=15, retries=1), 200, ""
-                except urllib.error.HTTPError as exc2:
-                    return None, exc2.code, ("HTTP %d (desktop) / HTTP %d (plain)"
-                                             % (exc.code, exc2.code))
-                except Exception as exc2:
-                    return None, exc.code, "HTTP %d (desktop) / %s (plain)" % (exc.code, exc2)
-            return None, exc.code, "HTTP %d %s" % (exc.code, body[:160])
-        except Exception as exc:
-            return None, 0, str(exc)
+        q, code, err = self._openapi_json(PATH_CAMPAIGNS,
+                                          headers=self.desktop_headers())
+        if q is None and code in (401, 403):
+            q2, code2, err2 = self._openapi_json(PATH_CAMPAIGNS,
+                                                 headers=self.headers())
+            if q2 is not None:
+                return q2, 200, ""
+            return None, code2, ("HTTP %d (desktop) / HTTP %d (plain)"
+                                 % (code, code2))
+        return q, code, err
+
 
     def campaigns(self, force=False):
         """GET /sash/api/v1/me/campaigns -> 官方活动平台状态（双区域通用）。
@@ -2227,6 +2581,22 @@ class Account(object):
                 and now - self._campaigns_cache[0] < CAMPAIGNS_TTL:
             return self._campaigns_cache[1]
         q, code, err = self._campaigns_get()
+        # issue: intl 签不到到 —— 列表被隐藏且本机无原生身份时，用「最小机器头」
+        # （只 os+hostname）再试一次；实测这一组合仍被服务端视为官方客户端。
+        if isinstance(q, dict) and not q.get("showCampaign") \
+                and getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED \
+                and not _machine_minimal_disabled():
+            try:
+                q2 = http_json(get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS,
+                               method="GET",
+                               headers=self.desktop_headers(minimal=True),
+                               timeout=15, retries=1)
+            except Exception:
+                q2 = None
+            if isinstance(q2, dict) and q2.get("showCampaign"):
+                log("campaigns: hidden list recovered with minimal machine headers "
+                    "(realm=%s)" % self.realm)
+                q, code, err = q2, 200, ""
         # 自愈条件必须与生产端同源：machine_identity_source 的合法值是
         # MACHINE_IDENTITY_NATIVE("runtime-info") 或 "derived"；"native" 仅为
         # 历史/测试桩别名。此前误用 native 字面量做等值判断，导致此分支永不命中
@@ -2339,8 +2709,10 @@ class Account(object):
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
+            headers = self.desktop_headers()
+            headers["Content-Type"] = "application/json"
             r = http_json(url, data=b"{}", method="POST",
-                          headers=self.desktop_headers(), timeout=20, retries=1)
+                          headers=headers, timeout=20, retries=1)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -2809,6 +3181,8 @@ class Account(object):
                 shared = {
                     "remain": int(_num(_src, "remaining")),
                     "used": int(_num(_src, "used")),
+                    # issue #67：cap=-1 是「不设上限」的哨兵值，不是真实额度；
+                    # remaining 往往只是占位填数（used 恒 0、同组织各账号回显一致）。
                     "size": int(_num(_src, "cap") or _num(_src, "total")),
                     # 缺键 = "没声明不可用" = 可用（与原 bool(_src.get("available", True)) 等价）；
                     # 显式 null / "false" / 0 = 不可用。写成 .get(k, True) + 默认 True
@@ -2818,6 +3192,9 @@ class Account(object):
                     "source": _key,
                     **_expiry_of(_src),
                 }
+                if shared["size"] < 0:
+                    # 无限池：display 与护栏都不应把占位的 remaining 当余额
+                    shared["unlimited"] = True
                 break
             if isinstance(_src, (int, float)) and not isinstance(_src, bool):
                 shared = {"remain": int(_src), "used": 0, "size": int(_src),
@@ -2837,8 +3214,14 @@ class Account(object):
         # ——有效余额 = 套餐 remain + 可用的共享 remain。护栏与汇总按它判断，
         # 否则「套餐用满但共享池还有 952」会被误判为余额耗尽。
         _shared_avail = (shared.get("remain") or 0) \
-            if (shared and shared.get("available", True)) else 0
+            if (shared and shared.get("available", True)
+                and not shared.get("unlimited")) else 0
         remain_effective = int(remain + _shared_avail)
+        _prev_eff = None
+        try:
+            _prev_eff = (self.credits or {}).get("remain_effective")
+        except Exception:
+            _prev_eff = None
         self.credits = {
             "remain": remain,
             "remain_effective": remain_effective,
@@ -2852,6 +3235,14 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 面板用：积分变化（正=进账、负=消耗）。只在数值真的变了时更新，
+        # 同日多次刷新保留最后一次，避免签到 +100 被后续刷新覆盖成 0。
+        try:
+            if _prev_eff is not None and int(_prev_eff) != int(remain_effective):
+                self.last_credits_delta = int(remain_effective) - int(_prev_eff)
+                self.last_credits_delta_at = time.time()
+        except Exception:
+            pass
         self.last_quota_anomaly = None    # 正常体：清掉上次异常标记
         self.credits_degraded = None
         # task-61：余额刷新是 402 停放的**唯一**解封路径（remain > 0 才解）。
@@ -3825,8 +4216,8 @@ class AccountPool(object):
             uid = str(ui.get("id") or uid)
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
-            org_id = str(ui.get("organization_id") or "")
-            org_name = str(ui.get("organization_name") or "")
+            org_id = str(ui.get("organization_id") or ui.get("organizationId") or "")
+            org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             user_type, org_id, org_name = DEFAULT_USER_TYPE, "", ""
 
@@ -3881,8 +4272,8 @@ class AccountPool(object):
             uid = str(ui.get("id") or "")
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
-            org_id = str(ui.get("organization_id") or "")
-            org_name = str(ui.get("organization_name") or "")
+            org_id = str(ui.get("organization_id") or ui.get("organizationId") or "")
+            org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             pass
         if data.get("expires_in"):

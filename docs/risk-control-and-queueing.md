@@ -183,3 +183,52 @@ GET /api/v2/service/ask/queue/status?requestSetId=<id>&modelKey=<key>&queueType=
    （`QD_QUEUE_MAX_ROUNDS` 默认 6、`QD_QUEUE_WAIT_BUDGET_SECS` 默认 600），并加 0~2s 抖动，
    避免多客户端同时唤醒打同一队列；
 2. **可见性**：等待期间日志明确写「第 N 轮 / 已等 Xs」，客户端侧表现为「慢」而不是「403」。
+
+---
+
+## 8. 国际版（intl）与国内版的差异（实测）
+
+数据来自本机 intl 客户端（Qoder 0.4.8）的 endpoint 缓存：
+`~/.qoder/.cache/endpoint-cache.json` 与 `qoder-client-endpoint-cache.json`。
+
+```json
+{
+  "inference":          "https://api3.qoder.sh",
+  "securityInference":  "https://api2.qoder.sh",
+  "center":             "https://center.qoder.sh",
+  "openapi":            "https://openapi.qoder.sh"
+}
+```
+
+### 8.1 intl 把「推理」和「安全推理」拆成两个集群
+
+- 国内版：`securityInference` 默认与 `inference` **同一个 host**；
+- 国际版：推理走 **api3**，**安全推理单独走 api2**。
+
+这是 intl 独有的风险层：一部分推理类请求（安全/守卫类判定）打到 **api2 专用集群**，
+与正常对话的 api3 分开限流。**用 api1 做主力是旧配置**——官方 0.4.8 候选首位是 api3，
+本机实测 api1 常年超时（api1 直连 6s 超时，api2/api3 均正常响应 404）。
+
+> 本仓已按官方顺序对齐：intl 主 `api3`，备 `api2` / `api1`；可用 `QD_INTL_GATEWAY` 覆盖。
+
+### 8.2 endpoint 可被服务端「选举」覆盖
+
+客户端按用途（`inference` / `securityInference` / `center` / `openapi` / `webSearch`）解析地址，
+且支持 `elected*` 覆盖（`electedSecurityInferEndpoint` 等）。含义：上游可按账号/区域/A-B
+动态把客户端导向不同集群——「同版本同网络、不同账号表现不同」是可能的。
+
+### 8.3 intl 的其他已知差异
+
+| 项 | intl | cn |
+|---|---|---|
+| 签到接口 `/sash/api/v1/me/daily-check-in/*` | 404（不存在） | 可用 |
+| 团队共享额度 | `orgResourcePackage`（cap/available） | 同 |
+| openapi 可达性 | 受 GA/出口影响大（直连偶发超时） | 稳定 |
+| 容器出口 | 更容易被风控/排队（#57） | 相对宽松 |
+
+### 8.4 实践结论
+
+1. **intl 用 api3 主力**（已对齐），传输失败自动切 api2/api1；
+2. intl 更依赖出口质量：住宅/固定 IP 优先，容器直连最容易排队；
+3. 安全推理(api2) 与对话(api3) 分限流——一侧被限不代表另一侧；
+4. 队列仍是**模型级**：换区不解决排队。

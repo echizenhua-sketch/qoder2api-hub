@@ -103,11 +103,9 @@ finally:
 check("#59 超限在发网络请求前就地抛 413（不会打爆账号池）",
       isinstance(_raised59, P.PayloadTooLarge) and _raised59.status == 413,
       _raised59)
-check("#59 413 文案可读（提示减图/缩图）",
-      "payload too large" in P.friendly_upstream_error(
-          413, "payload too large: 1 > 0")[0]
-      or "请求体过大" in P.friendly_upstream_error(
-          413, "payload too large: 1 > 0")[0])
+_f59 = P.friendly_upstream_error(413, "payload too large: 1 > 0")
+check("#59 413 文案：type=payload_too_large 且文案含「请求体过大」",
+      _f59[1] == "payload_too_large" and "请求体过大" in _f59[0], _f59)
 
 # ---------------------------------------------------------------- #58
 print("[58] 模型清单磁盘缓存 + 刷新端点")
