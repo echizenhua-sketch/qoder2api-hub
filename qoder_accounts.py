@@ -2967,25 +2967,8 @@ class Account(object):
 
 
     def _checkin_stamped_today(self):
-        """本地「本轮（当前 10:00 窗口）是否已盖章」——防重复写盘的短路判据。
-
-        旧实现按自然日（`%Y-%m-%d`）比较，与官方的 10:00 批次边界不一致，
-        会让 09:00 那次「上一批已领」的观测把当天 10:00 之后的领取机会一并
-        堵死（见 current_checkin_window_start 的说明）。
-
-        现在改为**批次感知**：
-          · 有 `lastCheckinBatch`（落盘的批次起点）-> 与当前窗口起点比较；
-          · 老数据没有该字段 -> 退回按 lastCheckin 的日期推算所属批次起点
-            （取当天 10:00；若 lastCheckin 时刻早于当天 10:00，则属于前一天
-            的批次），再与当前窗口起点比较。
-        这样 09:00 领到的「上一批」不会算作「本轮已领」，10:00 之后仍可重试。
-        """
-        batch = self.last_checkin_batch
-        if not batch:
-            batch = self._infer_checkin_batch(self.last_checkin)
-        if not batch:
-            return False
-        return int(batch) >= current_checkin_window_start()
+        """#25-e：本地今天是否已盖章（防重复写盘的短路判据）。"""
+        return str(self.last_checkin or "").startswith(time.strftime("%Y-%m-%d"))
 
     @staticmethod
     def _infer_checkin_batch(stamp):
