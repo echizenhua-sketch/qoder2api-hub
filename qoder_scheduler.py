@@ -330,6 +330,7 @@ class Scheduler(object):
                         self._execute_cycle("整点排程命中 (%s)" % label, kind)
                     except Exception as exc:
                         self.log("排程执行异常: %s" % exc)
+                    self._calc_next_fire()
             self._stop_event.wait(15)
 
     def _calc_next_fire(self):
@@ -462,9 +463,11 @@ class Scheduler(object):
 
         self.log("巡检完成：Token 保活 %d 个，签到 %d 个，本次新增积分 +%d"
                  % (ka["refreshed"], checkin_count, earned))
+        self._calc_next_fire()
         self._save_state()
 
     def status(self):
+        self._calc_next_fire()
         return {
             "enabled": self.enabled,
             "checkin_times": self._fmt_times(self.checkin_times),
