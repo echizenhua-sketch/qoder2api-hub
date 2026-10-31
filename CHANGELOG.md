@@ -9,6 +9,88 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.10
+
+**🐛 问题修复**
+
+- **流式/非流式 usage 未归一为 OpenAI 标准位**（#112）：上游按模型族换缓存字段（DeepSeek `prompt_cache_hit_tokens`、Qwen `completion_tokens_details.cached_tokens`），出口原样透传，按标准协议解析的客户端读到的 `cached_tokens` 恒为 0。
+  新增 `normalize_usage_for_client()`：复用 `_extract_usage` 的优先级把数字搬进 `usage.prompt_tokens_details.cached_tokens`，**原字段保留**（已适配上游形态的客户端不受影响）；接在流式 `clean_chunk`（usage 帧）与非流式 `aggregate_stream` 两处。上游完全没给缓存时不凭空造字段；普通内容帧仍逐字节原样透传。
+
+**✨ 新增：计费模型自检**
+
+- `POST /diag/model-billing {model, realm?}`（面板鉴权）：发一个最小请求（ping + `max_tokens=16`），返回 `{billed: [...], billed_mismatch, account, elapsed_ms}` —— 用来回答「上游到底按哪个模型记账」；
+- 面板「模型库」每行新增 **自检** 按钮，结果直接 toast；
+- `usage` 行的 `billed_model`（v1.7.8）保留，但**日志改为同 (请求, 回报) 组合每小时只提醒一次** —— 实测上游对网关身份常常统一回报 `auto`（连 `dfmodel` 也是），逐请求 WARN 会把日志刷满。
+
+**🔧 客户端身份可覆盖（#113 排查用）**
+
+- 新增 `QD_COSY_CLIENTTYPE`（默认 `5`，即 CLI 形态）与 `QD_COSY_UA`（默认 `undici`）环境变量，配合既有的 `QD_COSY_VERSION`：用户可以把**自己官方 CLI 的身份**原样搬过来做 A/B，验证上游是否按客户端身份决定模型授权/记账。
+- 未伪造任何东西：`minimal_version.vsc = 999.999.999` 这类哨兵值只出现在注释里解释现象，不进代码分支。
+
+**🌐 i18n（PR #114 合并）**
+
+- 原生 `alert` / `confirm` / `prompt` 翻译层 `installDialogI18n`（只翻第一个字符串参数、其余透传、幂等）；`i18n/en.json` 扩到 608 消息 / 226 模式 / 26 片段；新增 `scripts/extract_i18n_keys.py` 提取工具与 `docs/i18n.md` 重写。
+- ⚠️ PR 只定义了 `installDialogI18n` 却**从未调用、也没导出**（功能等于没做）。合并后补上接线：`initLangSystem` 启动时装一次（`installDialogI18n(window, t)`）+ 导出到 `window.QD_I18N.API`，并加 17 条回归断言（含「确实被装进语言系统」这条接线检查）。
+
+**验证**：新增 `_test_issue112_usage.py`(15)、`_test_issue113_model_billing.py`(18)、`_test_i18n_dialog.js`(17)；`/diag/model-billing` 走真实服务 e2e（200 + 401 两条路径，实测返回 `billed=["auto"]`）。全量 **89 suites / 2462 checks / 0 failed**。
+
+## v1.7.9
+
+**✨ 新增**
+
+- **账号管理表格支持按列排序**（#111）：版本 / 账号 / 状态 / 积分 / 请求 / 总 token / 缓存 七列可点表头，升序 → 降序 → 恢复默认（三态循环），当前列显示 ▲ / ▼，状态存 `localStorage` 刷新后保持。
+  - **账号列自然序**：`Z Z2` 排在 `Z Z10` 之前（`localeCompare({numeric:true})`，忽略大小写与首尾空白，昵称缺失退回 UID）；
+  - **积分列两种口径**：点击=剩余额度、`Shift+点击`=已用额度；
+  - **取不到值的一律沉底且不随方向翻转** —— 额度拉取失败（`envelopes HTTP 403 code 112` 这类）不会被当成 0 混进「额度用尽」中间，降序时也不会翻到最上面；
+  - 状态列按「可用 → 异常 → 冷却 → 停用 → 过期」排；护栏 / 操作列不参与排序；同值时按账号名自然序稳定排列。
+
+**验证**：新增 `tests/_test_issue111_account_sort.js`（27 条：自然序、两种额度口径、失败沉底与方向无关、请求/token/缓存数值序、状态优先级、三态循环与持久化、表头锚点与指示符）；真实浏览器里点表头复核排序结果与 ▲▼ 指示。全量 **86 suites / 2413 checks / 0 failed**。
+
+## v1.7.8
+
+**✨ 新增**
+
+- **模型上下文窗口可配置**（#106）：官方清单多数模型默认 200K 档，模型本身支持 1M/400K。
+  - 面板「模型库」新增 **上下文设置** 列（下拉：默认 / 官方 context_config 各档位），写入 `settings.json.model_context` 立即生效；
+  - 请求头 `X-QD-Context: 1M`（或 token 数）单次请求抬窗，chat / responses / anthropic 三端点都支持，优先级高于面板；
+  - 生效位置是出站 `model_config.max_input_tokens`（与官方桌面端选档同一通道）；超出官方档位被忽略并 WARN；客户端无法用 body 里的 `_qd_context` 伪造（入口先清除，只信 HTTP 头）。
+
+**🐛 问题修复 / 可观测性**
+
+- **Kimi-K3 等被上游静默回退成 auto 计费，现在完全可见**（#105）：实测 CN 区 `kmodel_latest` 会被上游按 `auto` 路由计费（官方清单标 `minimal_version.vsc=999.999.999` = 该形态未放量，网关无法也不应伪造更高客户端版本）。
+  - usage 行新增 `billed_model`（仅当上游 usage.model ≠ 请求模型时写入，其余行格式零变化）；
+  - WARN 日志 `upstream billed a different model: requested=... billed=auto`；
+  - 面板「最近请求」模型列出现红色 **计费→auto** 徽标——「以为在用 Kimi、实际在用 auto」一眼可辨。
+- **额度类 403（code 112 额度耗尽 / 110 每日次数上限）快速失败**（#108，PR #109 合并）：不再当普通「账号被拒」——112 冷却 30 分钟、110 冷却到本地 0 点（封顶 6h），且**刻意绕开 single_account 的 3s 压缩**（单号池不再 3 秒一轮反复撞同一个耗尽账号）；不禁用账号、不喂降权，10605 排队路径不受影响；客户端侧 503 文案点明「请充值或启用其它账号」。
+
+**🌐 面板 i18n（PR #107 合并）**
+
+- 零依赖 DOM 边界翻译层：丢一个 `i18n/<code>.json` 进目录即出现在语言菜单（manifest 每请求重读，热加载）；未命中一律回中文（结构不变式 `t(t(x))===t(x)`，观察者必收敛）；
+- 首个语言包 `i18n/en.json`（343 消息 / 68 模式 / 10 片段）；`/i18n/*` 只读白名单 + realpath 收敛（挡住 `..` 与指向 accounts/ 的软链）；语言选择在本地记忆；
+- ⚠️ 该 PR 同时把 14 个无关文件整体换成 CRLF 行尾（workflows 的多行 `run:` 在 ubuntu runner 上是经典炸点）。已在合并后单独还原这些文件为仓库既有 LF blob（**内容零差异**），净 diff 只含 9 个实质文件、2355 行纯新增。
+
+**验证**：新增 `_test_issue105_106.py`(23)、PR 侧 `_test_quota_envelope.py`(21) + `_test_i18n_*.js/py`(104)；设置接口走真实服务 e2e（401/存/取/清全链路）；全量 **85 suites / 2386 checks / 0 failed**。
+
+## v1.7.7
+
+**🐛 问题修复**
+
+- **DSH「一键配置」写入未加引号的 YAML 值，纯数字 Key 让 DSH 完全起不来**（#103 / PR #104）：`yaml_refs_upsert()` 用字符串插值直接拼 `key: value`，YAML 会把 `13800138000`、`007`、`1e5`、`true`、`null` 解析成非字符串；DSH 的 credentials-local 对 `refs` 值做硬校验（`typeof !== "string"` 直接抛 `TypeError`），于是 `credentials` 插件不激活 → `connection`/`authorization` 与全部 tauri、mcp 插件级联 waiting → Harness 进程 exit 1，而面板全程显示「配置成功」。
+  现在统一用 `json.dumps()` 生成**双引号标量**（同时也是合法 YAML double-quoted scalar，转义覆盖换行/引号/反斜杠/控制字符）；三处写入点全部走它。
+  另外补了**写后自检**：`refs_value_is_scalar_string()` 校验写入结果，不合格就让 `plan()` 直接抛错——面板不会再报「配置成功」。
+
+**✨ 新功能**
+
+- **禁用与签到解耦**（#102）：`enabled` 只表示「不接推理流量」，不再顺带停掉每日签到。
+  - 账号新增 `checkinWhenDisabled`（默认关 = 维持历史行为）；停用的账号行多一个 **仍签到** 勾选；
+  - 口径拆成两个谓词：`inference_eligible()`（`enabled + token`，推理选号不变）与 `checkin_eligible()`（有 token 且「启用或开了开关」）；
+  - 面板每日签到、任务中心批量签到/领福利、调度器整点签到三条路径都改用后者；**凭证失效/过期仍排除**（`stale_uids` 逻辑不动）；
+  - 新接口 `POST /accounts/checkin-when-disabled {uid, value}`，落盘即生效。
+
+  副作用是好的：照常签到让认证会话保持活性，重新启用时更不容易撞上「token 早已静默过期」。
+
+**验证**：`_test_issue103_yaml_refs_quoting.py`（PR 自带 74 条）、新增 `_test_issue103_selfcheck.py`（17 条：十种危险 Key 都能安全写入 + 自检函数四态）、新增 `_test_issue102_checkin_decoupled.py`（18 条：两谓词语义、持久化/public、三条路径源码守卫、端到端落盘回读）；全量 **80 suites / 2236 checks / 0 failed**。
+
 ## v1.7.6
 
 **🐛 问题修复**
