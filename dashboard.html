@@ -1916,6 +1916,10 @@ window.initLangSystem();
     <div class="insight-grid" id="insightCards"></div>
 
     <div class="insight-block">
+      <h2>全价请求 <em id="fullPriceHint"></em></h2>
+      <div id="fullPriceWrap"></div>
+    </div>
+    <div class="insight-block">
       <h2>官方积分消耗 <em id="creditUsageHint"></em></h2>
       <div id="creditUsageWrap"></div>
     </div>
@@ -2574,12 +2578,29 @@ async function loadUpdateState(force, btn){
       state.innerHTML = '发现新版本 <b style="color:var(--accent)">' + esc(r.latest) + '</b>'
         + '（当前 ' + esc(r.current) + '）';
       state.style.color = 'var(--accent)';
+      // issue #132：按钮是否渲染以 /update/plan 的 can_apply 为准 ——
+      // 「环境变量禁用 / 容器内 / 非本机访问」三种情况后端必然 403，
+      // 此前仍给一个按了就报错的按钮。
+      let plan = null;
+      try{ plan = await getJSON('/update/plan'); }catch(e){ plan = null; }
+      const canApply = !!(plan && plan.can_apply);
+      const why = ((plan && plan.apply_blocked_reasons) || []).filter(Boolean);
       if(actions){
-        actions.innerHTML = '<button class="sec" style="font-size:11px;padding:3px 10px;'
-          + 'margin-right:10px;background:var(--accent);color:#fff;border-color:var(--accent)" '
-          + 'onclick="applyUpdate(this)">一键更新</button>'
-          + (r.url ? ('<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
-          + 'style="color:var(--dim);text-decoration:underline">发布说明 →</a>') : '');
+        const releaseLink = r.url
+          ? ('<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
+             + 'style="color:var(--dim);text-decoration:underline">发布说明 →</a>')
+          : '';
+        if(canApply){
+          actions.innerHTML = '<button class="sec" style="font-size:11px;padding:3px 10px;'
+            + 'margin-right:10px;background:var(--accent);color:#fff;border-color:var(--accent)" '
+            + 'onclick="applyUpdate(this)">一键更新</button>' + releaseLink;
+        } else {
+          // 必然失败的动作不给按钮：直接说清原因 + 给手动路径
+          actions.innerHTML = '<span style="font-size:11px;color:var(--warn)">'
+            + esc(why.length ? ('无法一键更新：' + why.join('；')) : '无法一键更新')
+            + '</span> <span style="font-size:11px;color:var(--dim)">'
+            + '（可手动：下载新 release 覆盖安装目录后重启进程）</span> ' + releaseLink;
+        }
       }
       setUpdateBadge(r);      // 顶部徽标提醒升级
     } else {
@@ -2714,20 +2735,6 @@ async function loadModels(){
   }
 }
 
-// issue #113：模型「计费自检」
-async function checkModelBilling(model, btn){
-  if(btn){ btn.disabled = true; btn.textContent = "检测中"; }
-  try{
-    const r = await postJSON("/diag/model-billing", {model: model});
-    if(!r.ok){ toast(model + " 自检失败: " + (r.error || "未知错误"), "bad"); return; }
-    const billed = (r.billed || []).join(", ") || "(上游未回报模型名)";
-    toast(r.billed_mismatch
-      ? (model + " → 上游实际按 " + billed + " 计费（计费与限额都按它算）")
-      : (model + " → 上游按 " + billed + " 计费，一致"),
-      r.billed_mismatch ? "bad" : "ok");
-  }catch(e){ toast("自检请求失败: " + e.message, "bad"); }
-  finally{ if(btn){ btn.disabled = false; btn.textContent = "自检"; } }
-}
 function renderAvailableModels(){
   const tb = document.querySelector('#modelsTable tbody');
   if(!tb) return;
@@ -2866,10 +2873,7 @@ function renderAvailableModels(){
         + esc('该模型只在' + (excl === 'intl' ? '国际版' : '国内版') + '提供：默认出口在另一区时会被自动路由改走（未开自动路由则该请求不可用）')
         + '">仅' + (excl === 'intl' ? '国际版' : '国内版') + '</span>'
       : '';
-    const _billBtn = // issue #113：一键「计费自检」——上游是否按另一个模型计费，比日志更直观
-    ' <button class="bill-check" title="发一个最小请求，返回上游实际按哪个模型计费（kmodel_latest 这类被上游改路由时能立刻看出来）"'
-      + ' onclick="checkModelBilling(\'' + esc(m.id) + '\', this)" style="font-size:10px;padding:1px 6px;margin-left:4px">自检</button>';
-    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + _billBtn + '</div>'];
+    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + '</div>'];
     if(m.enabled === false){
       const reason = m.disabled_reason || '需要升级或购买千问官方套餐开放';
       idLines.push('<div style="margin-top:3px"><span class="badge warn" title="' + esc(reason)
@@ -2944,10 +2948,24 @@ async function loadVmState(force){
       : '本机虚拟化检测';
     const ev = document.getElementById("vmEvidence");
     if(ev){
+      // issue #123 后续：两个来源分开写，避免「本地：单板计算机」与
+      // 「官方风控：KVM」并排出现时看起来自相矛盾。
       const lines = [];
-      if(r.score !== null && r.score !== undefined) lines.push('风控评分 ' + r.score + '/100');
-      if(r.source === 'local') lines.push('官方风控桥不可用，以下为本机交叉校验');
-      (r.evidence || []).slice(0, 3).forEach(function(x){ lines.push(String(x)); });
+      const localLine = (r.local_evidence || r.evidence || [])
+        .filter(function(x){ return String(x).indexOf('单板计算机') === 0; })[0];
+      if(localLine) lines.push('本地硬件：' + String(localLine).replace('检测到', ''));
+      const bi = r.bridge_vm_info || {};
+      if(bi.isVm !== undefined && bi.isVm !== null){
+        lines.push('官方风控：' + (bi.isVm ? '判定为虚拟机' : '判定为物理机')
+          + (bi.brand ? ' · ' + String(bi.brand) : '')
+          + (bi.percentage !== undefined && bi.percentage !== null ? ' · 评分 ' + bi.percentage : '')
+          + (bi.vmTypeCode !== undefined && bi.vmTypeCode !== null ? ' · 类型码 ' + bi.vmTypeCode : ''));
+      } else if(r.bridge_available === false){
+        lines.push('官方风控：桥不可用（本机未找到 runtime-info），以下为本机交叉校验');
+      }
+      (r.evidence || []).slice(0, 3).forEach(function(x){
+        if(String(x).indexOf('单板计算机') !== 0) lines.push(String(x));
+      });
       ev.innerHTML = lines.map(esc).join('<br>');
     }
     const card = document.getElementById("cardVmState");
@@ -3325,6 +3343,31 @@ let INSIGHT_SIG = "";
 // 官方积分消耗（0.4.3 客户端新增接口 /accounts/credits/usage）：累计 + 峰值日 + 365 天热力图
 let CREDIT_USAGE_SIG = "";
 let CREDIT_USAGE_AT = 0;
+// issue #129 后续：把「缓存为 0 的超长 prompt」单独拎出来 —— 它是最容易被忽略的成本项
+function renderFullPrice(fp){
+  const box = document.getElementById("fullPriceWrap");
+  const hint = document.getElementById("fullPriceHint");
+  if(!box) return;
+  const n = Number((fp && fp.requests) || 0);
+  const credit = Number((fp && fp.credit) || 0);
+  const share = (fp && fp.credit_share != null) ? fp.credit_share : null;
+  const th = (fp && fp.threshold) || 100000;
+  if(hint){
+    hint.textContent = n ? ("（" + n + " 次）") : "（无）";
+  }
+  if(!n){
+    box.innerHTML = '<div class="empty">当前窗口没有「缓存为 0 的超长请求」——前缀复用良好</div>';
+    return;
+  }
+  const pct = share == null ? "—" : (share + "%");
+  box.innerHTML = '<div class="insight-hero" style="margin-bottom:10px">'
+    + '<div><div style="font-size:26px;font-weight:800;color:#e08b2b">' + n + '<span style="font-size:13px;font-weight:600;color:var(--dim)"> 次</span></div>'
+    + '<div style="font-size:11px;color:var(--dim);margin-top:2px">输入 ≥ ' + fmt(th) + ' 且缓存命中为 0</div></div>'
+    + '<div style="text-align:right"><div style="font-size:18px;font-weight:700;color:var(--accent2)">' + credit.toFixed(2) + ' 积分</div>'
+    + '<div style="font-size:11px;color:var(--dim);margin-top:2px">占窗口积分 ' + pct + '</div></div></div>'
+    + '<div class="legend"><span>这类请求按<b>全价</b>计费：换前缀（改系统提示/工具清单）、新开会话、或压缩历史后首轮最容易命中。'
+    + '想降成本就保持前缀稳定，并让长会话走压缩而不是重开。</span></div>';
+}
 async function loadCreditUsage(force){
   if(!force && Date.now() - CREDIT_USAGE_AT < 60000) return;
   CREDIT_USAGE_AT = Date.now();
@@ -4300,7 +4343,12 @@ async function testAccount(uid, btn){
     if(r.ok){
       toast('测试通过 (' + r.elapsed_ms + 'ms) [' + r.model + ']: ' + (r.reply || '正常'), 'ok');
     } else {
-      toast('测试失败: ' + (r.error || r.status || '异常'), 'bad');
+      // issue #134：后端已给人话 hint（额度耗尽 / 上游排队 / 凭证过期…），
+      // 以前只显示上游原文，用户得自己从 JSON 里读码。这里 hint 优先。
+      const _head = r.hint ? (r.hint + '  ') : '';
+      const _tail = r.hint ? ('（' + (r.error || r.status || '异常') + '）')
+                           : (r.error || r.status || '异常');
+      toast('测试失败: ' + _head + _tail, 'bad');
     }
     await loadAccounts();
   }catch(e){
@@ -4789,6 +4837,88 @@ function effortCell(r){
   return '<span class="badge warn" title="请求 ' + esc(req) + '，实际下发 ' + esc(eff) + '：归一化时被挪档">' + mono(req) + ' → ' + mono(eff) + '</span>';
 }
 
+// issue #129 后续：积分三段拆分单元格（非缓存输入 / 缓存输入 / 输出）
+function creditSplitCell(r){
+  const sp = r.credit_split;
+  if(r.error || !sp) return '<span style="color:var(--dim)">—</span>';
+  const fmtPart = v => {
+    const n = Number(v || 0);
+    if(!n) return '<span style="color:var(--dim)">0</span>';
+    return n >= 100 ? n.toFixed(0) : (n >= 1 ? n.toFixed(1) : n.toFixed(2));
+  };
+  const total = Number(sp.input || 0) + Number(sp.cached || 0) + Number(sp.output || 0);
+  // 缓存字段缺失时缓存段标 ?，避免把「没有数据」读成「零命中」
+  const cachedKnown = r.cached_reported !== false;
+  const cacheTxt = cachedKnown ? fmtPart(sp.cached)
+    : '<span style="color:var(--dim)" title="上游没有回报缓存字段，缓存段无法折算">?</span>';
+  const nominal = (r.billable === false);
+  const style = nominal ? 'opacity:.62;font-style:italic' : '';
+  return '<span style="' + style + '" title="' + esc(
+      (nominal ? '名义成本（上游标记为不计费）' : '实际扣费') +
+      '：非缓存输入 ' + (sp.input || 0) + ' + 缓存输入 ' + (sp.cached || 0) +
+      ' + 输出 ' + (sp.output || 0) + ' = ' + total.toFixed(2) + ' 积分') + '">'
+    + '<span style="color:#e08b2b">' + fmtPart(sp.input) + '</span>'
+    + '<span style="color:var(--dim)">+</span>' + '<span style="color:#26bb82">' + cacheTxt + '</span>'
+    + '<span style="color:var(--dim)">+</span>' + '<span style="color:var(--think)">' + fmtPart(sp.output) + '</span>'
+    + (nominal ? '<span style="font-size:9px;color:var(--dim);margin-left:3px">名义</span>' : '')
+    + '</span>';
+}
+// issue #129：每次调用的积分消耗可视化
+function creditCell(r){
+  if(r.error) return '<span style="color:var(--dim)">—</span>';
+  const c = Number(r.credit || 0);
+  const orig = Number(r.original_credits || 0);
+  if(!c && !orig) return '<span style="color:var(--dim)">0</span>';
+  const shown = (c || orig);
+  const txt = shown >= 100 ? shown.toFixed(0) : shown.toFixed(2);
+  // 有折扣（original_credits > credit）时把原价划掉，避免「怎么这么贵」的误读
+  const disc = (orig > c + 1e-9)
+    ? ' <span style="font-size:10px;color:var(--dim);text-decoration:line-through">'
+      + (orig >= 100 ? orig.toFixed(0) : orig.toFixed(2)) + '</span>'
+    : '';
+  const color = shown >= 100 ? 'color:#e08b2b' : 'color:var(--accent2)';
+  return '<b style="' + color + '">' + txt + '</b>' + disc;
+}
+
+function creditTitle(r){
+  const c = Number(r.credit || 0), orig = Number(r.original_credits || 0);
+  const parts = ['本次扣费 ' + c + ' 积分'];
+  if(orig > c + 1e-9) parts.push('原价 ' + orig + '（当前有折扣/谷时价）');
+  if(r.billable === false) parts.push('上游标记为不计费');
+  return parts.join(' · ');
+}
+
+function recentCreditSummary(rows){
+  let sum = 0, sumOrig = 0, n = 0;
+  (rows || []).forEach(function(r){
+    if(r.error) return;
+    const c = Number(r.credit || 0), o = Number(r.original_credits || 0);
+    sum += c; sumOrig += (o > c ? o : c); n += 1;
+  });
+  if(!n) return '';
+  const disc = sumOrig > sum + 1e-9
+    ? '（原价 <span style="text-decoration:line-through">' + sumOrig.toFixed(2) + '</span>）'
+    : '';
+  // issue #129 后续：合计也按三段拆开，整页成本落在哪一段一目了然
+  let part = { input: 0, cached: 0, output: 0 };
+  (rows || []).forEach(function(r){
+    const sp = r.credit_split;
+    if(!sp) return;
+    part.input += Number(sp.input || 0);
+    part.cached += Number(sp.cached || 0);
+    part.output += Number(sp.output || 0);
+  });
+  const splitTxt = '<span style="color:#e08b2b">输入 ' + part.input.toFixed(1) + '</span>'
+    + ' <span style="color:var(--dim)">+</span> '
+    + '<span style="color:#26bb82">缓存 ' + part.cached.toFixed(1) + '</span>'
+    + ' <span style="color:var(--dim)">+</span> '
+    + '<span style="color:var(--think)">输出 ' + part.output.toFixed(1) + '</span>';
+  return '<div class="legend" style="margin-top:6px"><span>本页 ' + n + ' 次调用合计 '
+    + '<b style="color:var(--accent2)">' + sum.toFixed(2) + '</b> 积分' + disc
+    + '（拆分：' + splitTxt + '）'
+    + '；单次扣费按积分列（鼠标悬停看明细）</span></div>';
+}
+
 async function refreshInner(){
   let usage, recent, perf;
   try{
@@ -4870,14 +5000,11 @@ async function refreshInner(){
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th style="text-align:right;width:84px">积分</th><th style="text-align:right;width:150px" title="按 token 折算的三段贡献：非缓存输入 + 缓存输入 + 输出；斜体「名义」表示上游标记为不计费">积分拆分</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model)
-      + (r.billed_model && r.billed_model !== r.model
-        ? ' <span class="badge bad" title="上游实际按 ' + esc(r.billed_model) + ' 计费（该模型对网关身份未开放或被回退，计费与限额按它算）">' + '计费→' +
-            esc(r.billed_model) + '</span>'
-        : '') + '</td>'
+        + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
         + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'
@@ -4891,7 +5018,10 @@ async function refreshInner(){
         + '<td style="color:var(--think)">' + fmt(r.reasoning_tokens) + '</td>'
         + '<td>' + (r.cache_hit_pct!=null ? r.cache_hit_pct+'%' : '—') + '</td>'
         + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
+        + '<td style="text-align:right" title="' + esc(creditTitle(r)) + '">' + creditCell(r) + '</td>'
+        + '<td style="text-align:right;white-space:nowrap;font-size:11px">' + creditSplitCell(r) + '</td>'
       + '</tr>').join('') + '</tbody></table>'
+      + recentCreditSummary(rows)
     : '<div class="empty">还没有请求记录</div>';
   renderEffortByKey();   // 样本变了就重算档位分布
   renderRealmActual();   // #26：卡片「最近一次对话的出口」也读这批 usage 行（不再依赖响应头）
@@ -5439,6 +5569,11 @@ async function saveApiKeys(btn){
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
     note: (row.note || '').trim(),
+    // issue #131-1：白名单必须随载荷回去 —— 少了它服务端只能按「没提交」
+    // 处理（会保留旧值），但显式清空就再也做不到了；带上才能区分两者。
+    // 没有该字段时 JSON 序列化会直接丢掉它 -> 服务端按「未提交」保留旧值；
+    // 只有真的加载过白名单的行才会显式提交（含空数组=清除限制）。
+    models: Array.isArray(row.models) ? row.models.slice() : undefined,
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){
@@ -6902,6 +7037,8 @@ async function loadAnalytics(force){
     }
   }catch(e){ /* 样本取不到不影响主看板 */ }
   loadQuality();
+  try{ renderFullPrice(statData && statData.full_price); }
+  catch(e){ /* 全价请求卡失败不影响主看板 */ }
   try{ loadCreditUsage(!!force); }catch(e){ /* 官方积分消耗失败不影响主看板 */ }
 }
 
