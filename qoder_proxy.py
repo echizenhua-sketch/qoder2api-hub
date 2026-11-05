@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.22"
+VERSION = "1.7.23"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2558,7 +2558,13 @@ def derive_affinity_key(messages):
                 log("affinity: skip %d msgs (> %d), letting the pool rotate"
                     % (len(msgs), AFFINITY_MAX_MSGS))
             return None
-        head = msgs[:2]
+        # issue #136：只用首条 user 消息做亲和键。system 里常带每轮变化的运行时
+        # 上下文，一旦把它算进去，长会话的亲和键会逐轮变化 -> 账号轮换 ->
+        # 上游缓存整段丢失（面板上就是 98% ↔ 0% 来回跳）。
+        head = [m for m in msgs
+                if isinstance(m, dict) and str(m.get("role")) == "user"][:1]
+        if not head:
+            head = msgs[:1]
         blob = json.dumps(head, ensure_ascii=False,
                           sort_keys=True).encode("utf-8")
         return "pfx-" + hashlib.sha256(blob).hexdigest()[:16]
@@ -6532,15 +6538,65 @@ def _conversation_key_from_history(payload):
     return "turn:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def conversation_identity(payload, client_session_key=None):
-    """本请求所属的上游会话身份（issue #128）。返回 {"id","begin_at"} 或 None。"""
-    if not CONVERSATION_SHARE:
-        return None
+def _conversation_window_key(payload, client_session_key=None):
+    """窗口级会话键（整段对话恒定）：显式键优先，否则用「system + 首条 user + 模型」。
+
+    issue #136：上游的 prompt 缓存是**按 session_id** 命中的，所以会话窗口内
+    必须复用同一个 session_id；而用量归组要按「一次提问」（#128 后续）。
+    两者解耦：窗口键喂 session_id，提问键喂 business.id / chat_record_id。
+    """
     key = str(client_session_key or "").strip()
     if key:
-        # issue #128 后续：窗口级 id 会把几小时的会话并成一条，用量面板看不出
-        # 单次对话时长。这里在显式键后追加「本轮提问」摘要 —— 同一次提问内的
-        # 工具步进仍归同一条，用户下次提问才换 id。
+        return key
+    if not isinstance(payload, dict):
+        return ""
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        return ""
+    system = ""
+    first_user = ""
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(str((p or {}).get("text") or "")
+                                for p in content if isinstance(p, dict))
+        text = str(content or "")
+        if role == "system" and not system:
+            system = text[:200]
+        elif role == "user" and not first_user:
+            first_user = text[:400]
+        if system and first_user:
+            break
+    if not first_user:
+        return ""
+    # 只用「模型 + 首条 user 消息」：system 里常带**每轮都会变**的运行时上下文
+    # （cwd / git 状态 / 当前时间），把它算进键会让窗口键每轮都变 → session_id
+    # 每轮都换 → 上游 prompt 缓存永远打不中（issue #136 的第二层原因）。
+    raw = "\x00".join([str(payload.get("model") or ""), first_user])
+    return "win:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def conversation_identity(payload, client_session_key=None):
+    """本请求的上游会话身份（issue #128 / #136）。
+
+    返回 {"id", "window_id", "begin_at"} 或 None：
+      · id        —— **按一次提问**（用法归组：business.id / chat_record_id）
+      · window_id —— **按整段对话**（喂 session_id，保证上游 prompt 缓存命中）
+      · begin_at  —— 本次提问的起点（用量面板据此显示单次对话时长）
+
+    #136 的根因就是这两者被合成一个：v1.7.17 把 id 改成「一次提问一个」，
+    session_id 跟着变，于是每次新提问上游缓存都从 0 开始（面板上就是
+    98% ↔ 0% 来回跳）。现在窗口内 session_id 恒定，提问边界只影响归组。
+    """
+    if not CONVERSATION_SHARE:
+        return None
+    window_key = _conversation_window_key(payload, client_session_key)
+    key = str(client_session_key or "").strip()
+    if key:
+        # issue #128 后续：用量按「一次提问」归组（用户下次提问才换 id）。
         _turn = _conversation_key_from_history(payload)
         if _turn:
             key = key + "|" + _turn
@@ -6554,13 +6610,16 @@ def conversation_identity(payload, client_session_key=None):
         if entry is not None and now - entry["at"] <= _CONV_TTL_SECS:
             entry["at"] = now
             _CONVERSATIONS.move_to_end(key)
-            return {"id": entry["id"], "begin_at": entry["begin_at"]}
-        entry = {"id": str(uuid.uuid4()), "begin_at": int(now * 1000), "at": now}
+            return {"id": entry["id"], "begin_at": entry["begin_at"],
+                    "window_id": entry.get("window_id") or entry["id"]}
+        entry = {"id": str(uuid.uuid4()), "begin_at": int(now * 1000),
+                 "window_id": window_key or "", "at": now}
         _CONVERSATIONS[key] = entry
         _CONVERSATIONS.move_to_end(key)
         while len(_CONVERSATIONS) > _CONV_MAX_ENTRIES:
             _CONVERSATIONS.popitem(last=False)
-        return {"id": entry["id"], "begin_at": entry["begin_at"]}
+        return {"id": entry["id"], "begin_at": entry["begin_at"],
+                "window_id": entry.get("window_id") or entry["id"]}
 
 
 
@@ -7912,7 +7971,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         assign_prefix_session(body_obj, account, model_key,
                               client_session_key=client_session_key,
                               usage_ctx=usage_ctx,
-                              fallback_session_id=(_conv or {}).get("id"))
+                              # issue #136：session_id 用**窗口级** id（整段对话恒定），
+                              # 不能用「一次提问」那个 id —— 否则每轮新提问缓存都归零。
+                              fallback_session_id=((_conv or {}).get("window_id")
+                                                   or (_conv or {}).get("id")))
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
